@@ -89,8 +89,48 @@ func TestRegisterLocalVersion(t *testing.T) {
 	if withoutRepo.Current != "dev" || withoutRepo.State != "unconfigured" {
 		t.Fatalf("unexpected local version: %+v", withoutRepo)
 	}
+	configuredMux := http.NewServeMux()
+	if err := Register(configuredMux, t.TempDir(), "dev", "fixture/imon", Options{Desktop: true}); err != nil {
+		t.Fatal(err)
+	}
+	configured := readInfo(t, makeRequest(configuredMux, "GET", "/api/v1/version", ""), http.StatusOK)
+	if configured.State != "configured" || configured.Repository != "fixture/imon" ||
+		configured.RepositoryURL != "https://github.com/fixture/imon/releases" || configured.CanApply {
+		t.Fatalf("unexpected desktop configuration: %+v", configured)
+	}
 	if err := Register(http.NewServeMux(), t.TempDir(), "dev", "fixture/.."); err == nil {
 		t.Fatal("accepted invalid repository")
+	}
+}
+
+func TestDesktopReleaseAsset(t *testing.T) {
+	for _, tt := range []struct {
+		goos, goarch, want string
+	}{
+		{"darwin", "amd64", "imon-desktop_darwin_amd64.zip"},
+		{"darwin", "arm64", "imon-desktop_darwin_arm64.zip"},
+		{"linux", "amd64", "imon-desktop_linux_amd64.deb"},
+		{"windows", "amd64", "imon-desktop_windows_amd64_setup.exe"},
+		{"linux", "arm64", ""},
+	} {
+		t.Run(tt.goos+"/"+tt.goarch, func(t *testing.T) {
+			s, mux, _ := testSource(t)
+			s.assetName = releaseAsset(tt.goos, tt.goarch, true)
+			if s.assetName != tt.want {
+				t.Fatalf("desktop asset = %q, want %q", s.assetName, tt.want)
+			}
+			checked := readInfo(t, makeRequest(mux, "GET", "/api/v1/version/update", ""), http.StatusOK)
+			if tt.want == "" {
+				if checked.State != "asset_missing" || checked.AssetURL != "" {
+					t.Fatalf("unexpected unsupported desktop update: %+v", checked)
+				}
+				return
+			}
+			if checked.State != "available" || checked.AssetURL != "https://github.com/fixture/imon/releases/download/v1.2.0/"+tt.want ||
+				checked.CanApply {
+				t.Fatalf("unexpected desktop update: %+v", checked)
+			}
+		})
 	}
 }
 

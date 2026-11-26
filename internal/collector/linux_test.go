@@ -574,3 +574,41 @@ func TestListenersDoNotPublishPartialSSRowsWhenFallbackIsUnavailable(t *testing.
 		t.Fatalf("incomplete listener snapshot: got %d rows, %v; want command_unavailable and no rows", len(rows), err)
 	}
 }
+
+func TestListenersEnrichOnlyExactExistingEndpoints(t *testing.T) {
+	cfg := sshFixture(t, func(command string, _ io.Reader, channel ssh.Channel) int {
+		switch command {
+		case hostProbeCommand:
+			return 0
+		case locale + "ss -H -l -n -t -p -4":
+			_, _ = io.WriteString(channel, "LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:8081 0.0.0.0:*\n")
+		case locale + "ss -H -l -n -t -p -6", locale + "ss -H -l -n -u -p -4", locale + "ss -H -l -n -u -p -6":
+		case portsHelperCommand:
+			_ = json.NewEncoder(channel).Encode(map[string]string{
+				"ss_ipv4": "tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:((\"web\",pid=20,fd=3))\n" +
+					"udp UNCONN 0 0 127.0.0.1:8081 0.0.0.0:* users:((\"udp\",pid=21,fd=4))\n" +
+					"tcp LISTEN 0 128 127.0.0.1:8082 0.0.0.0:* users:((\"other\",pid=22,fd=4))\n",
+			})
+		default:
+			t.Errorf("unexpected command: %q", command)
+			return 1
+		}
+		return 0
+	})
+	rows, err := Collect(t.Context(), "host", cfg, "", "listeners")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("listeners = %v, %v", rows, err)
+	}
+	for i, r := range rows {
+		var listener listenRecord
+		if err := json.Unmarshal(r.Data, &listener); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 && (listener.Port != 8080 || listener.ProcessState != "ok" || !strings.Contains(listener.Process, "pid=20")) {
+			t.Fatalf("new process owner = %+v", listener)
+		}
+		if i == 1 && (listener.Port != 8081 || listener.ProcessState != "unreadable" || listener.Process != "") {
+			t.Fatalf("unmatched listener = %+v", listener)
+		}
+	}
+}

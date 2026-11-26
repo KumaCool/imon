@@ -52,3 +52,57 @@ func TestRunUnitActionShellQuotesEscapedUnitName(t *testing.T) {
 		t.Fatalf("commands = %d, want probe/read/write/read", len(commands))
 	}
 }
+
+func TestRunUnitActionHelperReceivesOnlyExactActionAndUnit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		exit     int
+		wantCode string
+		wantSent bool
+	}{
+		{"granted", 0, "", true},
+		{"legacy helper requires upgrade", 80, "service_helper_upgrade_required", false},
+		{"not run", 81, "service_action_not_run", false},
+		{"result unknown", 82, "command_failed", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const unit = "example.service"
+			var stopped bool
+			cfg := sshFixture(t, func(command string, input io.Reader, channel ssh.Channel) int {
+				switch {
+				case command == hostProbeCommand:
+					return 0
+				case strings.Contains(command, "systemctl --no-pager show"):
+					if stopped {
+						_, _ = io.WriteString(channel, "Id="+unit+"\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n")
+					} else {
+						_, _ = io.WriteString(channel, "Id="+unit+"\nLoadState=loaded\nActiveState=active\nSubState=running\n")
+					}
+					return 0
+				case strings.HasSuffix(command, `sudo -n -- "$helper" service`):
+					payload, err := io.ReadAll(input)
+					if err != nil || string(payload) != "stop\n"+unit+"\n" {
+						t.Errorf("helper arguments = %q, %v", payload, err)
+					}
+					if tc.exit == 0 {
+						stopped = true
+					}
+					return tc.exit
+				default:
+					t.Errorf("unexpected command: %q", command)
+					return 1
+				}
+			})
+			key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.SSH.HostKey))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := RunServiceAction(t.Context(), "host", cfg, ssh.FingerprintSHA256(key), ActionRequest{
+				Action: "stop", Key: unit, Name: unit, ExpectedState: "running",
+			}, func(int32) error { return nil })
+			if Code(err) != tc.wantCode || result.Sent != tc.wantSent || result.Confirmed != (tc.exit == 0) {
+				t.Fatalf("action = %+v, %v", result, err)
+			}
+		})
+	}
+}

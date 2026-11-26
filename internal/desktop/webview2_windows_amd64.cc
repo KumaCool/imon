@@ -1,6 +1,7 @@
 //go:build windows && amd64 && cgo && desktop
 
 #include "webview2_windows.h"
+#include "windows_icon.h"
 #define WEBVIEW_STATIC
 #include "vendor/webview.h"
 #include <commdlg.h>
@@ -90,6 +91,7 @@ std::string quote(const std::string &s) {
 struct Session {
   webview_t window{};
   HWND hwnd{};
+  HICON big_icon{}, small_icon{};
   Com<ICoreWebView2> view;
   Com<ICoreWebView2Environment> env;
   uintptr_t handle{};
@@ -110,6 +112,8 @@ struct Session {
       view.reset();
     }
     if (window) webview_destroy(window);
+    if (big_icon) DestroyIcon(big_icon);
+    if (small_icon) DestroyIcon(small_icon);
   }
 };
 std::mutex active_lock;
@@ -301,6 +305,13 @@ extern "C" int infra_windows_run(uintptr_t id,const char *proof,const char *html
   s.window=webview_create(0,nullptr);
   if (!s.window) return -1;
   s.hwnd=static_cast<HWND>(webview_get_window(s.window));
+  HMODULE executable=GetModuleHandleW(nullptr);
+  s.big_icon=static_cast<HICON>(LoadImageW(executable,MAKEINTRESOURCEW(IMON_APP_ICON),IMAGE_ICON,
+    GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),0));
+  s.small_icon=static_cast<HICON>(LoadImageW(executable,MAKEINTRESOURCEW(IMON_APP_ICON),IMAGE_ICON,
+    GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),0));
+  if (s.big_icon) SendMessageW(s.hwnd,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(s.big_icon));
+  if (s.small_icon) SendMessageW(s.hwnd,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(s.small_icon));
   auto *controller=static_cast<ICoreWebView2Controller *>(webview_get_native_handle(s.window,WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER));
   ICoreWebView2 *view{};
   if (!controller || FAILED(controller->get_CoreWebView2(&view)) || !view) return -2;

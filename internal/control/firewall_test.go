@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"imon/internal/collector"
+	"imon/internal/firewall"
 	"imon/internal/store"
 )
 
@@ -95,21 +96,174 @@ func TestFirewallMaintenanceResumesSameAction(t *testing.T) {
 func TestFirewallAuthorizationComparesHelperVersions(t *testing.T) {
 	for _, tc := range []struct {
 		name, status, installed, available string
-		update                             bool
+		update, upToDate                   bool
 	}{
-		{"new application, same helper", "installed", "a", "a", false},
-		{"changed helper", "installed", "a", "b", true},
-		{"no compatible platform package", "installed", "a", "", false},
-		{"absent", "uninstalled", "", "b", false},
-		{"native privileges", "native", "", "b", false},
-		{"unconfirmed", "unknown", "", "b", false},
+		{"new application, same helper", "installed", "abcde0", "abcde0", false, true},
+		{"same short code, changed helper", "installed", "abcde0", "abcde1", true, false},
+		{"no compatible platform package", "installed", "a", "", false, false},
+		{"unreported version", "installed", "", "a", false, false},
+		{"absent", "uninstalled", "", "b", false, false},
+		{"native privileges", "native", "", "b", false, false},
+		{"unconfirmed", "unknown", "", "b", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := makeFirewallAuthorizationState(collector.MaintenanceResult{Status: tc.status, Version: tc.installed}, tc.available)
-			if state.Status != tc.status || state.InstalledVersion != tc.installed || state.AvailableVersion != tc.available || state.UpdateAvailable != tc.update {
+			if state.Status != tc.status || state.InstalledVersion != tc.installed || state.AvailableVersion != tc.available ||
+				state.UpdateAvailable != tc.update || state.UpToDate != tc.upToDate {
 				t.Fatalf("unexpected authorization state: %+v", state)
 			}
 		})
+	}
+}
+
+func TestVerifiedFirewallUpdateRefreshesAuthorizationStatus(t *testing.T) {
+	const arch = "amd64"
+	available, _ := firewall.Version(arch)
+	if available == "" {
+		t.Skip("requires the embedded amd64 host authorization helper")
+	}
+	c, mux := setupCollection(t)
+	seedCollectionTarget(t, c, "fixture", "host")
+	b := binding{Target: store.Target{ID: "fixture", ConnectionRev: 1}}
+	queryOK(t, c.db.Write(t.Context(), func(tx *sql.Tx) error {
+		old := collector.MaintenanceResult{Status: "installed", Version: "older-helper", Architecture: arch}
+		return c.recordFirewallObservation(t.Context(), tx, b, old, time.Now().UnixMilli(), false)
+	}))
+	checkState := func(updateAvailable, upToDate bool) {
+		t.Helper()
+		var hosts struct {
+			Items []targetView `json:"items"`
+		}
+		queryAPI(t, mux, "/api/v1/targets?kind=host", 200, &hosts)
+		if len(hosts.Items) != 1 || hosts.Items[0].HostAuthorizationUpdateAvailable != updateAvailable ||
+			hosts.Items[0].HostAuthorizationUpToDate != upToDate {
+			t.Fatalf("unexpected host authorization summary: %+v", hosts.Items)
+		}
+		var authorization firewallAuthorizationState
+		queryAPI(t, mux, "/api/v1/hosts/fixture/firewall-authorization", 200, &authorization)
+		if authorization.Status != "installed" || authorization.UpdateAvailable != updateAvailable || authorization.UpToDate != upToDate {
+			t.Fatalf("unexpected host authorization detail: %+v", authorization)
+		}
+	}
+	checkState(true, false)
+
+	seedFirewallJob(t, c, "update", "fixture", "update", "running", "", nil)
+	status, err := c.finishFirewallMaintenance(t.Context(), Job{ID: "update"}, b, "update", arch, available,
+		collector.MaintenanceResult{Status: "verified", Version: available}, nil, false, false,
+		func(context.Context, string) error { return nil })
+	if err != nil || status != "success" {
+		t.Fatalf("finish update: %s, %v", status, err)
+	}
+	checkState(false, true)
+}
+
+func TestFirewallMigrationOfferAndVerification(t *testing.T) {
+	c, mux := setupCollection(t)
+	c.version = "v0.1.1"
+	seedCollectionTarget(t, c, "fixture", "host")
+	if err := c.db.Write(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE targets SET connection_ref='{"ssh":{"user":"fixture"}}' WHERE target_id='fixture'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedFirewallJob(t, c, "rejected", "fixture", "update", "failed", "helper_update_invalid", nil)
+	w := collectionHTTP(t, mux, "GET", "/api/v1/jobs/rejected", "", 200)
+	if body := w.Body.String(); strings.Contains(body, `"manual_upload_available"`) || strings.Contains(body, `"download_path"`) {
+		t.Fatalf("invalid signed update must not offer privileged migration: %s", body)
+	}
+	collectionHTTP(t, mux, "GET", "/api/v1/jobs/rejected/firewall-script", "", 404)
+	oldVersion, desiredVersion, scriptSHA := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	priorFacts := map[string]string{"installed_version": oldVersion}
+	b := binding{Target: store.Target{ID: "fixture", ConnectionRev: 1}}
+	queryOK(t, c.db.Write(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO firewall_authorization_observations
+			(target_id,connection_rev,status,version,architecture,markers_absent,app_version,observed_at)
+			VALUES ('fixture',1,'installed',?,'amd64',0,'v0.1.0',0)`, oldVersion)
+		return err
+	}))
+	cleanUnexpected := func(_ context.Context, path string) error { t.Fatalf("unexpected cleanup of %q", path); return nil }
+	seedFirewallJob(t, c, "old-offer", "fixture", "update", "failed", collector.FirewallMigrationRequired, map[string]string{
+		"installed_version": oldVersion, "installed_display_version": "aaaaa",
+		"requested_version": desiredVersion, "requested_display_version": "v0.1.1 bbbbb",
+	})
+	assertSavedLabel := func(want string) {
+		t.Helper()
+		savedOffer := Job{firewallJob: &firewallJob{}}
+		queryAPI(t, mux, "/api/v1/jobs/old-offer", 200, &savedOffer)
+		if got := savedOffer.Results["installed_display_version"]; got != want {
+			t.Fatalf("saved offer label = %q, want %q", got, want)
+		}
+	}
+	assertSavedLabel("v0.1.0 aaaaa")
+	setObservedDigest := func(digest string) {
+		t.Helper()
+		queryOK(t, c.db.Write(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE firewall_authorization_observations SET version=? WHERE target_id='fixture'`, digest)
+			return err
+		}))
+	}
+	setObservedDigest(oldVersion[:63] + "c")
+	assertSavedLabel("aaaaa")
+	setObservedDigest(oldVersion)
+	seedFirewallJob(t, c, "legacy", "fixture", "update", "running", "", nil)
+	status, err := c.finishFirewallMaintenance(t.Context(), Job{ID: "legacy", Results: priorFacts}, b, "update", "amd64", desiredVersion,
+		collector.MaintenanceResult{}, &collector.Error{Code: collector.FirewallMigrationRequired}, false, false, cleanUnexpected)
+	if err != nil || status != "failed" {
+		t.Fatalf("migration offer: status=%q err=%v", status, err)
+	}
+	assertVersions := func(job Job, installed, display string) {
+		t.Helper()
+		if job.Results["installed_version"] != installed || job.Results["requested_version"] != desiredVersion ||
+			job.Results["installed_display_version"] != display || job.Results["requested_display_version"] != "v0.1.1 bbbbb" {
+			t.Fatalf("unexpected version metadata: %+v", job.Results)
+		}
+	}
+	offer := Job{firewallJob: &firewallJob{}}
+	queryAPI(t, mux, "/api/v1/jobs/legacy", 200, &offer)
+	if !offer.ManualUploadAvailable || offer.Command != "" {
+		t.Fatalf("expected upload offer without execution instructions: %+v", offer.firewallJob)
+	}
+	assertVersions(offer, oldVersion, "v0.1.0 aaaaa")
+	path := "/api/v1/targets/fixture/maintenance/upload"
+	collectionHTTP(t, mux, "POST", path, `{"action":"install","auto_job_id":"legacy"}`, 409)
+	const stage = "/var/tmp/imon-upload.abc12345/firewall-maintain.sh"
+	seedFirewallJob(t, c, "staged", "fixture", "update", "running", "", nil)
+	status, err = c.finishFirewallMaintenance(t.Context(), Job{ID: "staged", Results: priorFacts}, b, "update", "amd64", desiredVersion,
+		collector.MaintenanceResult{Status: "awaiting_admin", StagedPath: stage, SHA256: scriptSHA}, nil, true, false, cleanUnexpected)
+	if err != nil || status != "awaiting_admin" {
+		t.Fatalf("migration staging: status=%q err=%v", status, err)
+	}
+	w = collectionHTTP(t, mux, "POST", path, `{"action":"update","auto_job_id":"legacy"}`, 202)
+	if id := firewallJobID(t, w.Body.Bytes()); id != "staged" {
+		t.Fatalf("expected staged migration job, got %s", id)
+	}
+	uploaded := Job{firewallJob: &firewallJob{}}
+	queryAPI(t, mux, "/api/v1/jobs/staged", 200, &uploaded)
+	if uploaded.Action != "update" || uploaded.SHA256 != scriptSHA || !strings.Contains(uploaded.Command, " imon install fixture ") {
+		t.Fatalf("expected update job with staged installer command and script checksum: %+v", uploaded.firewallJob)
+	}
+	assertVersions(uploaded, oldVersion, "v0.1.0 aaaaa")
+	seedFirewallJob(t, c, "verify", "fixture", "verify", "running", "", nil)
+	var cleaned string
+	status, err = c.finishFirewallMaintenance(t.Context(), Job{ID: "verify"}, b, "verify", "amd64", "",
+		collector.MaintenanceResult{Status: "installed", Version: desiredVersion}, nil, false, false, func(_ context.Context, path string) error {
+			cleaned = path
+			return nil
+		})
+	if status != "success" || err != nil || cleaned != stage {
+		t.Fatalf("verification did not clear staged migration: status=%q path=%q err=%v", status, cleaned, err)
+	}
+	verified := Job{firewallJob: &firewallJob{}}
+	queryAPI(t, mux, "/api/v1/jobs/staged", 200, &verified)
+	if verified.Status != "success" || verified.StagePath != "" {
+		t.Fatalf("staged migration remains unresolved: %+v", verified)
+	}
+	assertVersions(verified, desiredVersion, "v0.1.1 bbbbb")
+	verification := Job{firewallJob: &firewallJob{}}
+	queryAPI(t, mux, "/api/v1/jobs/verify", 200, &verification)
+	if verification.Results["installed_display_version"] != "v0.1.1 bbbbb" {
+		t.Fatalf("verification lost the installed version label: %+v", verification.Results)
 	}
 }
 
@@ -146,6 +300,57 @@ func TestFirewallVerificationDoesNotCompleteOlderHelperInstall(t *testing.T) {
 		if err != nil || status != "success" || (len(paths) > 0) != (observation == "new") {
 			t.Fatalf("observation %s: status=%q paths=%v err=%v", observation, status, paths, err)
 		}
+	}
+}
+
+func TestLegacyHostAuthorizationVerificationChecksOldSelection(t *testing.T) {
+	c, _ := setupCollection(t)
+	seedCollectionTarget(t, c, "fixture", "host")
+	wanted := strings.Repeat("b", 64)
+	seedFirewallJob(t, c, "staged", "fixture", "install", "awaiting_admin", "", map[string]string{
+		"requested_version": "unchanged", "requested_units_sha256": wanted,
+	})
+	for _, applied := range []bool{false, true} {
+		id := fmt.Sprintf("verify-%t", applied)
+		seedFirewallJob(t, c, id, "fixture", "verify", "running", "", nil)
+		var result collector.MaintenanceResult
+		result.Status, result.Version = "installed", "unchanged"
+		if applied {
+			result.LegacyServiceUnitsHash = wanted
+		}
+		cleaned := false
+		status, err := c.finishFirewallMaintenance(t.Context(), Job{ID: id}, binding{Target: store.Target{ID: "fixture", ConnectionRev: 1}},
+			"verify", "", "", result, nil, false, false, func(context.Context, string) error {
+				cleaned = true
+				return nil
+			})
+		if err != nil || cleaned != applied || (status == "success") != applied {
+			t.Fatalf("applied=%v status=%s cleaned=%v err=%v", applied, status, cleaned, err)
+		}
+	}
+}
+
+func TestHostAuthorizationUpgradeSupersedesLegacyStage(t *testing.T) {
+	c, mux := setupCollection(t)
+	seedCollectionTarget(t, c, "fixture", "host")
+	path := "/api/v1/hosts/fixture/firewall-maintenance"
+	collectionHTTP(t, mux, "POST", path, `{"action":"install","service_units":["fixture.service"]}`, 400)
+	seedFirewallJob(t, c, "legacy-stage", "fixture", "install", "awaiting_admin", "", map[string]string{
+		"requested_version":      "prior",
+		"requested_units_sha256": strings.Repeat("a", 64),
+	})
+	seedFirewallJob(t, c, "upgrade", "fixture", "install", "running", "", nil)
+	b := binding{Target: store.Target{ID: "fixture", ConnectionRev: 1}}
+	var cleanedPath string
+	status, err := c.finishFirewallMaintenance(t.Context(), Job{ID: "upgrade"}, b, "install", "amd64", "updated",
+		collector.MaintenanceResult{Status: "verified", Version: "updated"}, nil, false, false,
+		func(_ context.Context, path string) error { cleanedPath = path; return nil })
+	if err != nil || status != "success" || cleanedPath != "/var/tmp/imon-upload.abc12345/firewall-maintain.sh" {
+		t.Fatalf("upgrade status=%q cleaned=%q err=%v", status, cleanedPath, err)
+	}
+	w := collectionHTTP(t, mux, "GET", "/api/v1/jobs/legacy-stage", "", 200)
+	if body := w.Body.String(); !strings.Contains(body, `"status":"canceled"`) || strings.Contains(body, `"stage_path"`) {
+		t.Fatalf("legacy stage remains active: %s", body)
 	}
 }
 

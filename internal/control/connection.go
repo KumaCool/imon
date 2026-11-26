@@ -402,7 +402,7 @@ func (c *Control) checkHostFirewallCleanup(ctx context.Context, b binding) error
 	if err != nil {
 		return errFirewallCleanupUnverified
 	}
-	if probe.Status == "uninstalled" || probe.Status == "unknown" && probe.MarkersAbsent && confirmed {
+	if probe.Status == "uninstalled" || probe.Status == "native" || probe.Status == "unknown" && probe.MarkersAbsent && confirmed {
 		return nil
 	}
 	return errFirewallCleanupRequired

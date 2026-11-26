@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"os/exec"
@@ -11,6 +12,129 @@ import (
 
 	"golang.org/x/crypto/ssh"
 )
+
+func TestUpdateFirewallUsesOnlyInstalledHelperAndRequiresReadback(t *testing.T) {
+	oldVersion, newVersion := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	pkg := []byte("fixture-only update package\x00\xff")
+	for _, test := range []struct {
+		name, observed, current, update, readback, status, code string
+		calls                                                   int32
+	}{
+		{name: "first install", observed: "markers-absent", code: "helper_update_not_installed"},
+		{name: "old authorization", current: "imon:helper-legacy", code: FirewallMigrationRequired},
+		{name: "broken new authorization", current: "imon:helper-exit 5", code: "helper_update_host_state"},
+		{name: "already current", current: "installed " + newVersion, status: "verified"},
+		{name: "verified update", update: "installed " + newVersion, readback: "installed " + newVersion, status: "verified", calls: 1},
+		{name: "tampered update", update: "imon:helper-exit 2", code: "helper_update_invalid", calls: 1},
+		{name: "different architecture", update: "imon:helper-exit 3", code: "helper_update_architecture", calls: 1},
+		{name: "older release", update: "imon:helper-exit 4", code: "helper_update_stale", calls: 1},
+		{name: "already applied by another panel", update: "imon:helper-exit 4", readback: "installed " + newVersion, status: "verified", calls: 1},
+		{name: "interrupted transaction", update: "imon:helper-exit 5", status: "unknown", code: "helper_update_host_state", calls: 1},
+		{name: "remote update is unconfirmed", update: "installed " + newVersion, status: "unknown", code: "result_unconfirmed", calls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var updates atomic.Int32
+			cfg := sshFixture(t, func(command string, input io.Reader, channel ssh.Channel) int {
+				var output string
+				switch command {
+				case hostProbeCommand:
+				case inspectFirewallCommand:
+					output = test.observed
+					if output == "" {
+						output = "installed " + oldVersion
+					}
+				case helperVersionCommand:
+					output = test.current
+					if updates.Load() != 0 {
+						output = test.readback
+					}
+					if output == "" {
+						output = "installed " + oldVersion
+					}
+				case helperUpdateCommand:
+					updates.Add(1)
+					payload, err := io.ReadAll(input)
+					if err != nil || !bytes.Equal(payload, pkg) {
+						t.Errorf("signed update payload = %q, %v", payload, err)
+					}
+					output = test.update
+				default:
+					t.Errorf("unexpected SSH operation %q", command)
+					return 1
+				}
+				if output != "" {
+					_, _ = io.WriteString(channel, output+"\n")
+				}
+				return 0
+			})
+			key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.SSH.HostKey))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := UpdateFirewall(t.Context(), cfg, ssh.FingerprintSHA256(key), "amd64", newVersion, pkg)
+			if Code(err) != test.code || result.Status != test.status || result.Architecture != "amd64" || updates.Load() != test.calls {
+				t.Fatalf("result=%+v err=%v calls=%d", result, err, updates.Load())
+			}
+			if test.status == "verified" && result.Version != newVersion {
+				t.Fatalf("confirmed version %q; want %q", result.Version, newVersion)
+			}
+			var previousVersion string
+			if test.code == FirewallMigrationRequired {
+				previousVersion = oldVersion
+			}
+			if result.PreviousVersion != previousVersion {
+				t.Fatalf("previous version %q; want %q", result.PreviousVersion, previousVersion)
+			}
+		})
+	}
+}
+
+func TestHelperVersionRecognizesRestrictedAndAdministrativeLegacyAccounts(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("requires a POSIX shell")
+	}
+	const sudoFixture = `sudo() {
+  case "$*" in
+    '-n -- /usr/local/libexec/imon/firewall-read version')
+      case "$FIXTURE" in
+        signed) printf 'installed %s\n' "$VERSION" ;;
+        broken) return 5 ;;
+        password-required) printf 'sudo: a password is required\n' >&2; return 1 ;;
+        *) return 1 ;;
+      esac ;;
+    '-n -- /usr/local/libexec/imon/firewall-read')
+      case "$FIXTURE" in restricted|admin|password-required|broken) return 0;; *) return 1;; esac ;;
+    '-n -l -- /usr/local/libexec/imon/firewall-read')
+      [ "$FIXTURE" != denied ] ;;
+    '-n -l -- /usr/local/libexec/imon/firewall-read update')
+      [ "$FIXTURE" != restricted ] ;;
+    '-n -- /bin/sh -c /usr/bin/id -u')
+      [ "$FIXTURE" = admin ] || return 1
+      printf '0\n' ;;
+    *) return 2 ;;
+  esac
+}
+`
+	for _, test := range []struct{ fixture, expect string }{
+		{"signed", "installed " + strings.Repeat("a", 64)},
+		{"broken", "imon:helper-exit 5"},
+		{"restricted", "imon:helper-legacy"},
+		{"admin", "imon:helper-legacy"},
+		{"password-required", "imon:helper-legacy"},
+		{"denied", "imon:helper-exit 1"},
+		{"update-only", "imon:helper-exit 1"},
+	} {
+		t.Run(test.fixture, func(t *testing.T) {
+			script := sudoFixture + strings.Replace(helperVersionCommand, helperPathCommand, "helper=/usr/local/libexec/imon/firewall-read", 1)
+			cmd := exec.Command("/bin/sh", "-c", script)
+			cmd.Env = append(os.Environ(), "FIXTURE="+test.fixture, "VERSION="+strings.Repeat("a", 64))
+			got, err := cmd.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(got)) != test.expect {
+				t.Fatalf("version probe = %q, %v; want %q", got, err, test.expect)
+			}
+		})
+	}
+}
 
 func TestFirewallReaderLayouts(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
@@ -161,7 +285,7 @@ func TestFirewallUninstallRequiresAuthoritativeAbsence(t *testing.T) {
 	cfg := sshFixture(t, func(command string, _ io.Reader, channel ssh.Channel) int {
 		switch {
 		case command == hostProbeCommand:
-		case command == "sudo -n -- /usr/bin/id -u":
+		case command == autoMaintenanceProbe:
 			_, _ = io.WriteString(channel, "0\n")
 		case strings.HasPrefix(command, "imon_payload | sudo -n -- /bin/sh -c ") && strings.Contains(command, "uninstall --collector demo"):
 			if empty.Load() {
@@ -195,5 +319,84 @@ func TestFirewallUninstallRequiresAuthoritativeAbsence(t *testing.T) {
 	result, err = MaintainFirewall(t.Context(), cfg, admin, ssh.FingerprintSHA256(key), "uninstall", script)
 	if err != nil || result.Status != "verified" || !result.MarkersAbsent {
 		t.Fatalf("verified absence = %+v, %v", result, err)
+	}
+}
+
+func TestSelfUninstallFirewallRequiresHelperConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name, output, status, code string
+		exit                       int
+	}{
+		{name: "removed", output: "uninstalled", status: "uninstalled"},
+		{name: "old or denied", output: "imon:helper-exit 1", code: FirewallAdministratorRequired},
+		{name: "helper failure", output: "imon:helper-exit 5", status: "unknown", code: "result_unconfirmed"},
+		{name: "no confirmation", status: "unknown", code: "result_unconfirmed"},
+		{name: "unexpected confirmation", output: "uninstalled\nextra output", status: "unknown", code: "result_unconfirmed"},
+		{name: "command failure after output", output: "uninstalled", status: "unknown", code: "command_failed", exit: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			cfg := sshFixture(t, func(command string, _ io.Reader, channel ssh.Channel) int {
+				switch command {
+				case hostProbeCommand:
+					return 0
+				case helperUninstallCommand:
+					calls.Add(1)
+					if tc.output != "" {
+						_, _ = io.WriteString(channel, tc.output+"\n")
+					}
+					return tc.exit
+				default:
+					t.Errorf("unexpected command during self-uninstall: %q", command)
+					return 1
+				}
+			})
+			key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.SSH.HostKey))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := UninstallFirewall(t.Context(), cfg, ssh.FingerprintSHA256(key))
+			if Code(err) != tc.code || result.Status != tc.status || result.MarkersAbsent != (tc.status == "uninstalled") || calls.Load() != 1 {
+				t.Fatalf("self-uninstall result=%+v err=%v calls=%d", result, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestAutomaticMaintenanceVerifiesInstalledUnitDigest(t *testing.T) {
+	const script = "#!/bin/sh\n# synthetic package\n"
+	digest := strings.Repeat("a", 64)
+	var installed atomic.Bool
+	cfg := sshFixture(t, func(command string, input io.Reader, channel ssh.Channel) int {
+		switch {
+		case command == hostProbeCommand:
+		case command == autoMaintenanceProbe:
+			_, _ = io.WriteString(channel, "0\n")
+		case strings.HasPrefix(command, "imon_payload | sudo -n -- /bin/sh -c ") && strings.Contains(command, "install --collector demo"):
+			staged, err := io.ReadAll(input)
+			if err != nil || string(staged) != script {
+				t.Errorf("embedded script = %q, %v", staged, err)
+			}
+			installed.Store(true)
+			_, _ = io.WriteString(channel, "installed "+digest+"\n")
+		case command == locale+"id -u":
+			_, _ = io.WriteString(channel, "1000\n")
+		case command == locale+"sudo -n -- id -u":
+			return 126
+		case command == firewallCommand:
+			_, _ = io.WriteString(channel, `{"results":[{"backend":"nftables","status":"not_installed"}]}`)
+		default:
+			t.Errorf("unexpected automatic command %q", command)
+			return 1
+		}
+		return 0
+	})
+	key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.SSH.HostKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := MaintainFirewall(t.Context(), cfg, nil, ssh.FingerprintSHA256(key), "install", []byte(script))
+	if err != nil || !installed.Load() || result.Status != "verified" || result.Version != digest || result.StagedPath != "" {
+		t.Fatalf("automatic installation result = %+v, %v", result, err)
 	}
 }

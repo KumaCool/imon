@@ -146,16 +146,18 @@ func (c *Control) getJob(w http.ResponseWriter, r *http.Request) {
 		if err := tx.QueryRowContext(ctx, `SELECT job_id,target_id,kind,status,results,error_code,queued_at,completed_at FROM collection_jobs WHERE job_id=?`, r.PathValue("id")).Scan(&job.ID, &job.TargetID, &job.Kind, &job.Status, &raw, &job.Error, &job.QueuedAt, &job.CompletedAt); err != nil {
 			return err
 		}
+		if err := json.Unmarshal([]byte(raw), &job.Results); err != nil {
+			return err
+		}
 		if job.Kind == "firewall" {
 			job.firewallJob = &firewallJob{}
-			_, err := c.firewallDetails(ctx, tx, job.ID, job.firewallJob)
-			return err
+			if _, err := c.firewallDetails(ctx, tx, job.ID, job.firewallJob); err != nil {
+				return err
+			}
+			return refreshFirewallJobVersionLabel(ctx, tx, &job)
 		}
 		return nil
 	})
-	if err == nil {
-		err = json.Unmarshal([]byte(raw), &job.Results)
-	}
 	if err != nil {
 		report(w, err)
 		return

@@ -13,21 +13,24 @@ import (
 	"time"
 
 	"imon/internal/collector"
+	"imon/internal/firewall"
 	"imon/internal/store"
 )
 
 type targetView struct {
 	store.Target
-	Address                     string            `json:"address,omitempty"`
-	LastSuccessAt               *int64            `json:"last_success_at"`
-	ProbeObservedAt             *int64            `json:"probe_observed_at"`
-	ConnectionStatus            string            `json:"connection_status"`
-	ErrorCode                   string            `json:"error_code,omitempty"`
-	Summary                     map[string]any    `json:"summary"`
-	NodeLink                    map[string]string `json:"node_link,omitempty"`
-	FirewallStatus              string            `json:"firewall_status,omitempty"`
-	FirewallAuthorizationStatus string            `json:"firewall_authorization_status,omitempty"`
-	Stale                       bool              `json:"stale"`
+	Address                          string            `json:"address,omitempty"`
+	LastSuccessAt                    *int64            `json:"last_success_at"`
+	ProbeObservedAt                  *int64            `json:"probe_observed_at"`
+	ConnectionStatus                 string            `json:"connection_status"`
+	ErrorCode                        string            `json:"error_code,omitempty"`
+	Summary                          map[string]any    `json:"summary"`
+	NodeLink                         map[string]string `json:"node_link,omitempty"`
+	FirewallStatus                   string            `json:"firewall_status,omitempty"`
+	FirewallAuthorizationStatus      string            `json:"firewall_authorization_status,omitempty"`
+	HostAuthorizationUpdateAvailable bool              `json:"host_authorization_update_available,omitempty"`
+	HostAuthorizationUpToDate        bool              `json:"host_authorization_up_to_date,omitempty"`
+	Stale                            bool              `json:"stale"`
 }
 
 type targetDetail struct {
@@ -190,14 +193,19 @@ func enrich(ctx context.Context, tx *sql.Tx, t store.Target, settings Settings) 
 		}
 		// The firewall collection result and the maintenance helper state are
 		// intentionally separate.  The former says whether the last read
-		// worked; the latter drives the install/uninstall action in the list.
-		err = tx.QueryRowContext(ctx, `SELECT status FROM firewall_authorization_observations WHERE target_id=? AND connection_rev=?`, t.ID, t.ConnectionRev).Scan(&v.FirewallAuthorizationStatus)
-		if errors.Is(err, sql.ErrNoRows) {
-			// Keep the status empty until the dedicated authorization probe has
-			// classified the host. A readable firewall snapshot alone cannot
-			// distinguish native privilege from the installed helper.
-			err = nil
-		} else if err != nil {
+		// worked; the latter drives the authorization actions in the list.
+		var observed collector.MaintenanceResult
+		err = tx.QueryRowContext(ctx, `SELECT status,version,architecture FROM firewall_authorization_observations WHERE target_id=? AND connection_rev=?`, t.ID, t.ConnectionRev).
+			Scan(&observed.Status, &observed.Version, &observed.Architecture)
+		if err == nil {
+			v.FirewallAuthorizationStatus = observed.Status
+			if observed.Status == "installed" {
+				available, _ := firewall.Version(observed.Architecture)
+				authorization := makeFirewallAuthorizationState(observed, available)
+				v.HostAuthorizationUpdateAvailable = authorization.UpdateAvailable
+				v.HostAuthorizationUpToDate = authorization.UpToDate
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return v, err
 		}
 	} else {

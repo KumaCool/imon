@@ -287,6 +287,14 @@ func (s *sshConnection) runInput(ctx context.Context, command string, maximum in
 			var exit *ssh.ExitError
 			if errors.As(err, &exit) {
 				switch exit.ExitStatus() {
+				case 80:
+					if strings.HasSuffix(command, `sudo -n -- "$helper" service`) {
+						return nil, fail("service_helper_upgrade_required")
+					}
+				case 81:
+					if strings.HasSuffix(command, `sudo -n -- "$helper" service`) {
+						return nil, fail("service_action_not_run")
+					}
 				case 126:
 					return nil, fail("permission_denied")
 				case 127:
@@ -294,6 +302,7 @@ func (s *sshConnection) runInput(ctx context.Context, command string, maximum in
 				}
 				message := bytes.ToLower(stderr.buf.Bytes())
 				if bytes.Contains(message, []byte("permission denied")) ||
+					bytes.Contains(message, []byte("sudo: a password is required")) ||
 					(command == systemdInventoryCommand && bytes.Contains(message, []byte("access denied"))) {
 					return nil, fail("permission_denied")
 				}

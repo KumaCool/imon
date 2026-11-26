@@ -122,9 +122,25 @@ func runUnitAction(ctx context.Context, cfg Config, identity string, req ActionR
 	result.Sent = true
 	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, err = s.ssh.run(writeCtx, locale+"sudo -n -- /usr/bin/systemctl "+req.Action+" -- "+shellQuote(req.Key))
+	systemctl := "/usr/bin/systemctl " + req.Action + " -- " + shellQuote(req.Key)
+	// Decide between the already-authorized native path and the host helper
+	// before changing anything. Never retry a failed mutation through another
+	// identity because systemctl might have already submitted the job.
+	command := locale + `
+if [ "$(/usr/bin/id -u)" = 0 ]; then
+  exec ` + systemctl + `
+fi
+if sudo -n -l -- ` + systemctl + ` >/dev/null 2>&1; then
+  exec sudo -n -- ` + systemctl + `
+fi
+` + helperPathCommand + `
+[ -x "$helper" ] || exit 126
+sudo -n -l -- "$helper" service >/dev/null 2>&1 || exit 126
+imon_payload | sudo -n -- "$helper" service`
+	_, err = s.ssh.runInput(writeCtx, command, maxSSHOutput, []byte(req.Action+"\n"+req.Key+"\n"))
 	if err != nil {
-		if Code(err) == "permission_denied" {
+		switch Code(err) {
+		case "permission_denied", "service_helper_upgrade_required", "service_action_not_run":
 			result.Sent = false
 		}
 		return result, err

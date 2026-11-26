@@ -1,4 +1,4 @@
-// Command imon-firewall reads Linux firewall rules once as root.
+// Command imon-firewall provides the privileged Imon host operations.
 package main
 
 import (
@@ -172,8 +172,23 @@ func scan() []backend {
 }
 
 func main() {
-	if len(os.Args) != 1 || !root() {
-		fmt.Fprintln(os.Stderr, "firewall-read requires root and accepts no arguments")
+	if !root() || len(os.Args) > 2 {
+		fmt.Fprintln(os.Stderr, "Imon host helper requires root")
+		os.Exit(1)
+	}
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "ports":
+			if err := writePorts(os.Stdout); err == nil {
+				return
+			}
+		case "service":
+			os.Exit(runService(os.Stdin))
+		case "uninstall":
+			os.Exit(runHelperUninstall(os.Stdout))
+		case "update", "version":
+			os.Exit(runHelperUpdate(os.Args[1], os.Stdin, os.Stdout))
+		}
 		os.Exit(1)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"results": scan()}); err != nil {

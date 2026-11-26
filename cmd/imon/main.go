@@ -19,7 +19,7 @@ import (
 	"imon/internal/update"
 )
 
-var version = "v0.1.0"
+var version = "v0.1.1"
 var defaultReleaseRepo string
 
 const defaultPort = 8765

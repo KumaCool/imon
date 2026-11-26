@@ -34,6 +34,7 @@ type firewallAuthorizationState struct {
 	InstalledDisplayVersion string `json:"installed_display_version,omitempty"`
 	AvailableDisplayVersion string `json:"available_display_version,omitempty"`
 	UpdateAvailable         bool   `json:"update_available"`
+	UpToDate                bool   `json:"up_to_date"`
 	MarkersAbsent           bool   `json:"markers_absent,omitempty"`
 }
 
@@ -42,7 +43,10 @@ func makeFirewallAuthorizationState(observed collector.MaintenanceResult, availa
 	switch state.Status {
 	case "installed":
 		state.InstalledVersion = observed.Version
-		state.UpdateAvailable = observed.Version != "" && available != "" && observed.Version != available
+		if observed.Version != "" && available != "" {
+			state.UpToDate = observed.Version == available
+			state.UpdateAvailable = !state.UpToDate
+		}
 	case "uninstalled", "native":
 	default:
 		state.Status = "unknown"
@@ -90,6 +94,16 @@ func firewallDisplayVersion(appVersion, digest string) string {
 		return short
 	}
 	return appVersion + " " + short
+}
+
+func observedFirewallDisplayVersion(ctx context.Context, tx *sql.Tx, targetID string, revision int64, digest string) (string, error) {
+	var appVersion string
+	err := tx.QueryRowContext(ctx, `SELECT app_version FROM firewall_authorization_observations
+		WHERE target_id=? AND connection_rev=? AND status='installed' AND version=?`, targetID, revision, digest).Scan(&appVersion)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	return firewallDisplayVersion(appVersion, digest), nil
 }
 
 type firewallProbeKey struct {
@@ -213,7 +227,7 @@ func (c *Control) firewallUpload(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if in.AutoJobID == "" || (in.Action != "install" && in.Action != "uninstall") {
+	if in.AutoJobID == "" || (in.Action != "install" && in.Action != "update" && in.Action != "uninstall") {
 		report(w, errInvalid)
 		return
 	}
@@ -221,7 +235,7 @@ func (c *Control) firewallUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Control) queueFirewall(w http.ResponseWriter, r *http.Request, action string, credential *collector.Config, autoJobID string) {
-	if action != "install" && action != "uninstall" && action != "verify" {
+	if action != "install" && action != "update" && action != "uninstall" && action != "verify" {
 		report(w, errInvalid)
 		return
 	}
@@ -272,6 +286,8 @@ func (c *Control) queueFirewall(w http.ResponseWriter, r *http.Request, action s
 			err := tx.QueryRowContext(ctx, `SELECT j.job_id FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
 				WHERE m.target_id=? AND m.connection_rev=? AND m.action=?
 				AND j.status IN ('queued','running','unknown','awaiting_admin')
+				AND json_extract(j.results,'$.requested_units_sha256') IS NULL
+				AND NOT (m.action='update' AND j.status='unknown' AND m.stage_path='' AND json_extract(j.results,'$.upload_only') IS NULL)
 				AND (NOT ? OR json_extract(j.results,'$.upload_only')='true') ORDER BY j.rowid DESC LIMIT 1`,
 				id, b.ConnectionRev, action, autoJobID != "").Scan(&existingJobID)
 			if err == nil || !errors.Is(err, sql.ErrNoRows) {
@@ -281,10 +297,12 @@ func (c *Control) queueFirewall(w http.ResponseWriter, r *http.Request, action s
 		if err := checkNoMutation(ctx, tx, id, true); err != nil {
 			return err
 		}
-		if action == "install" {
+		if action == "install" || action == "update" {
 			var pending bool
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
-				WHERE m.target_id=? AND m.connection_rev=? AND m.action<>'verify' AND j.status IN ('unknown','awaiting_admin'))`, id, b.ConnectionRev).Scan(&pending); err != nil {
+				WHERE m.target_id=? AND m.connection_rev=? AND m.action<>'verify' AND j.status IN ('unknown','awaiting_admin')
+				AND NOT (m.action='install' AND json_extract(j.results,'$.requested_units_sha256') IS NOT NULL)
+				AND NOT (?='update' AND m.action='update' AND j.status='unknown' AND m.stage_path='' AND json_extract(j.results,'$.upload_only') IS NULL))`, id, b.ConnectionRev, action).Scan(&pending); err != nil {
 				return err
 			}
 			if pending {
@@ -295,10 +313,28 @@ func (c *Control) queueFirewall(w http.ResponseWriter, r *http.Request, action s
 			return err
 		}
 		if autoJobID != "" {
-			if _, err := tx.ExecContext(ctx, `UPDATE collection_jobs SET results=json_object('upload_only','true') WHERE job_id=?`, job.ID); err != nil {
+			job.Results = map[string]string{"upload_only": "true"}
+			if action == "update" {
+				var installed, displayVersion string
+				if err := tx.QueryRowContext(ctx, `SELECT coalesce(json_extract(results,'$.installed_version'),''),
+					coalesce(json_extract(results,'$.installed_display_version'),'')
+					FROM collection_jobs WHERE job_id=?`, autoJobID).Scan(&installed, &displayVersion); err != nil {
+					return err
+				}
+				if installed != "" {
+					job.Results["installed_version"] = installed
+					job.Results["installed_display_version"] = displayVersion
+				}
+			}
+			results, err := json.Marshal(job.Results)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE collection_jobs SET results=? WHERE job_id=?`, string(results), job.ID); err != nil {
 				return err
 			}
 		}
+
 		_, err := tx.ExecContext(ctx, `INSERT INTO firewall_maintenance(job_id,target_id,connection_rev,action) VALUES(?,?,?,?)`, job.ID, id, b.ConnectionRev, action)
 		return err
 	})
@@ -316,12 +352,16 @@ func (c *Control) queueFirewall(w http.ResponseWriter, r *http.Request, action s
 
 func firewallUploadEligible(ctx context.Context, tx *sql.Tx, jobID, targetID string, revision int64, action string) (bool, error) {
 	var eligible bool
+	errorCode := collector.FirewallAdministratorRequired
+	if action == "update" {
+		errorCode = collector.FirewallMigrationRequired
+	}
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
 		WHERE m.job_id=? AND m.target_id=? AND m.connection_rev=? AND m.action=? AND m.architecture<>''
 		AND j.status='failed' AND j.error_code=? AND j.job_id=(SELECT job_id FROM firewall_maintenance latest
 		JOIN collection_jobs recent USING(job_id) WHERE latest.target_id=m.target_id AND latest.connection_rev=m.connection_rev
 		AND latest.action<>'verify' AND (recent.status='success' OR json_extract(recent.results,'$.upload_only') IS NULL)
-		ORDER BY recent.rowid DESC LIMIT 1))`, jobID, targetID, revision, action, collector.FirewallAdministratorRequired).Scan(&eligible)
+		ORDER BY recent.rowid DESC LIMIT 1))`, jobID, targetID, revision, action, errorCode).Scan(&eligible)
 	return eligible, err
 }
 
@@ -330,7 +370,7 @@ func firewallHasPendingCleanup(ctx context.Context, tx *sql.Tx, id string) (bool
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1
 		FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
 		WHERE m.target_id=? AND (m.stage_path<>'' OR (
-			m.action IN ('install','uninstall') AND j.status IN ('queued','running','awaiting_admin','unknown')
+			m.action IN ('install','update','uninstall') AND j.status IN ('queued','running','awaiting_admin','unknown')
 		)))`, id).Scan(&pending)
 	return pending, err
 }
@@ -340,7 +380,7 @@ func firewallCleanupConfirmed(ctx context.Context, tx *sql.Tx, id string, revisi
 	err := tx.QueryRowContext(ctx, `SELECT coalesce((
 		SELECT coalesce(json_extract(j.results,'$.cleanup_confirmed')='true',0) AND NOT EXISTS (
 			SELECT 1 FROM firewall_maintenance newer JOIN collection_jobs newer_job USING(job_id)
-			WHERE newer.target_id=m.target_id AND newer.action='install'
+			WHERE newer.target_id=m.target_id AND newer.action IN ('install','update')
 				AND newer_job.rowid>j.rowid AND newer_job.status IN ('queued','running','awaiting_admin','unknown')
 		)
 		FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
@@ -352,16 +392,19 @@ func firewallCleanupConfirmed(ctx context.Context, tx *sql.Tx, id string, revisi
 }
 
 type firewallPendingJob struct {
-	id, action, path, version string
+	id, action, path, version, displayVersion, legacyUnitsHash string
+	superseded                                                 bool
 }
 
 func (c *Control) firewallPendingJobs(ctx context.Context, b binding, jobID string, includeOtherRevisions bool) ([]firewallPendingJob, error) {
 	var pending []firewallPendingJob
 	err := c.db.Read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT m.job_id,m.action,m.stage_path,
-			coalesce(json_extract(j.results,'$.requested_version'),'')
+			coalesce(json_extract(j.results,'$.requested_version'),''),
+			coalesce(json_extract(j.results,'$.requested_display_version'),''),
+			coalesce(json_extract(j.results,'$.requested_units_sha256'),'')
 			FROM firewall_maintenance m JOIN collection_jobs j USING(job_id)
-			WHERE m.target_id=? AND m.job_id<>? AND m.action IN ('install','uninstall')
+			WHERE m.target_id=? AND m.job_id<>? AND m.action IN ('install','update','uninstall')
 			AND (m.connection_rev=? OR ?)
 			AND (m.stage_path<>'' OR j.status IN ('awaiting_admin','unknown')) ORDER BY j.rowid`,
 			b.ID, jobID, b.ConnectionRev, includeOtherRevisions)
@@ -371,7 +414,7 @@ func (c *Control) firewallPendingJobs(ctx context.Context, b binding, jobID stri
 		defer rows.Close()
 		for rows.Next() {
 			var entry firewallPendingJob
-			if err := rows.Scan(&entry.id, &entry.action, &entry.path, &entry.version); err != nil {
+			if err := rows.Scan(&entry.id, &entry.action, &entry.path, &entry.version, &entry.displayVersion, &entry.legacyUnitsHash); err != nil {
 				return err
 			}
 			pending = append(pending, entry)
@@ -392,7 +435,6 @@ func (c *Control) runFirewall(job Job, b binding, action string, admin *collecto
 	}
 	var arch string
 	var version string
-	var script []byte
 	var opErr error
 	var result collector.MaintenanceResult
 	if action == "uninstall" && admin == nil && !uploadOnly {
@@ -410,8 +452,16 @@ func (c *Control) runFirewall(job Job, b binding, action string, admin *collecto
 					return err
 				})
 			}
+			if observed.Status == "native" {
+				observed.Status = "uninstalled"
+			}
 			if observed.Status == "uninstalled" {
 				result = observed
+			} else if observed.Status == "installed" {
+				result, opErr = collector.UninstallFirewall(ctx, b.Config, b.Identity)
+				if collector.Code(opErr) == collector.FirewallAdministratorRequired {
+					opErr = nil // Try the existing administrator workflow for old helpers.
+				}
 			}
 		} else if unbind {
 			opErr = err
@@ -421,19 +471,41 @@ func (c *Control) runFirewall(job Job, b binding, action string, admin *collecto
 		if arch == "" {
 			arch, opErr = collector.FirewallPlatform(ctx, b.Config, b.Identity)
 		}
-		if opErr == nil {
-			script, opErr = firewall.Script(arch)
-			if opErr != nil {
-				opErr = &collector.Error{Code: "maintenance_package_unavailable"}
+	}
+	if result.Status == "" && opErr == nil && action == "update" {
+		version, _ = firewall.Version(arch)
+		var signedPackage []byte
+		signedPackage, opErr = firewall.UpdatePackage(arch)
+		if opErr != nil || version == "" {
+			opErr = &collector.Error{Code: "maintenance_package_unavailable"}
+		} else if !uploadOnly {
+			result, opErr = collector.UpdateFirewall(ctx, b.Config, b.Identity, arch, version, signedPackage)
+			if collector.Code(opErr) == collector.FirewallMigrationRequired {
+				job.Results = map[string]string{"installed_version": result.PreviousVersion}
+				opErr = nil // A legacy helper requires the installer once.
 			}
-			version, _ = firewall.Version(arch)
 		}
 	}
 	if result.Status == "" && opErr == nil {
-		if uploadOnly {
-			result, opErr = collector.StageFirewall(ctx, b.Config, b.Identity, action, script)
-		} else {
-			result, opErr = collector.MaintainFirewall(ctx, b.Config, admin, b.Identity, action, script)
+		var script []byte
+		if action != "verify" || admin != nil {
+			script, opErr = firewall.Script(arch)
+			if opErr != nil {
+				opErr = &collector.Error{Code: "maintenance_package_unavailable"}
+			} else if version == "" {
+				version, _ = firewall.Version(arch)
+			}
+		}
+		if opErr == nil {
+			installerAction := firewallInstallerAction(action)
+			if uploadOnly {
+				result, opErr = collector.StageFirewall(ctx, b.Config, b.Identity, installerAction, script)
+			} else {
+				result, opErr = collector.MaintainFirewall(ctx, b.Config, admin, b.Identity, installerAction, script)
+				if action == "update" && collector.Code(opErr) == collector.FirewallAdministratorRequired {
+					opErr = &collector.Error{Code: collector.FirewallMigrationRequired}
+				}
+			}
 		}
 	}
 	if arch == "" {
@@ -450,7 +522,7 @@ func (c *Control) runFirewall(job Job, b binding, action string, admin *collecto
 		defer c.mu.Unlock()
 		current, err := c.target(finish, b.ID)
 		if err == nil && current.ConnectionRev == b.ConnectionRev {
-			if _, err = c.enqueue(finish, current, map[string]bool{"firewall": false}, true); err == nil {
+			if _, err = c.enqueue(finish, current, map[string]bool{"firewall": false, "listeners": false}, true); err == nil {
 				c.signal()
 			}
 		}
@@ -464,8 +536,9 @@ func (c *Control) finishFirewallMaintenance(ctx context.Context, job Job, b bind
 	if uploadOnly {
 		facts["upload_only"] = "true"
 	}
-	if action == "install" && version != "" {
+	if firewallInstallerAction(action) == "install" && version != "" {
 		facts["requested_version"] = version
+		facts["requested_display_version"] = firewallDisplayVersion(c.version, version)
 	}
 	switch result.Status {
 	case "verified":
@@ -486,23 +559,48 @@ func (c *Control) finishFirewallMaintenance(ctx context.Context, job Job, b bind
 	case "awaiting_admin":
 		status = "awaiting_admin"
 	}
-	if result.Version != "" {
-		facts["installed_version"] = result.Version
+	installed := result.Version
+	if installed == "" && action == "update" {
+		installed = job.Results["installed_version"]
 	}
-	if status == "success" && action == "install" && (result.Version == "" || result.Version != version) {
+	if installed != "" {
+		facts["installed_version"] = installed
+		embeddedVersion := version
+		if action == "verify" && embeddedVersion == "" {
+			embeddedVersion, _ = firewall.Version(arch)
+		}
+		if installed == embeddedVersion {
+			facts["installed_display_version"] = firewallDisplayVersion(c.version, installed)
+		} else if result.Version == "" {
+			facts["installed_display_version"] = job.Results["installed_display_version"]
+		}
+	}
+	if status == "success" && firewallInstallerAction(action) == "install" && (result.Version == "" || result.Version != version) {
 		status, opErr = "unknown", &collector.Error{Code: "result_unconfirmed"}
 		delete(facts, "firewall_status")
 	}
 	var cleaned []firewallPendingJob
-	if status == "success" && (action == "verify" || action == "uninstall") {
+	if status == "success" {
+		currentVersion, _ := firewall.Version(arch)
+		upgraded := firewallInstallerAction(action) == "install" || currentVersion != "" && result.Version == currentVersion
 		absent := facts["firewall_status"] == "uninstalled"
 		pending, err := c.firewallPendingJobs(ctx, b, job.ID, absent)
 		if err != nil {
 			status, opErr = "failed", &collector.Error{Code: "storage_unavailable"}
 		}
 		for _, entry := range pending {
-			if !absent && (entry.action != "install" || entry.version != "" && entry.version != result.Version) {
+			entry.superseded = upgraded && entry.action == "install" && entry.legacyUnitsHash != ""
+			if action == "install" && !entry.superseded {
 				continue
+			}
+			if !absent && !entry.superseded {
+				if firewallInstallerAction(entry.action) != "install" || entry.version != "" && entry.version != result.Version {
+					continue
+				}
+				if entry.legacyUnitsHash != "" && entry.legacyUnitsHash != result.LegacyServiceUnitsHash {
+					status, opErr = "failed", &collector.Error{Code: "service_units_unconfirmed"}
+					continue
+				}
 			}
 			if entry.path != "" {
 				clean, cancel := context.WithTimeout(ctx, 8*time.Second)
@@ -529,6 +627,13 @@ func (c *Control) finishFirewallMaintenance(ctx context.Context, job Job, b bind
 	}
 	var unbound bool
 	err := c.db.Write(finish, func(tx *sql.Tx) error {
+		if installed != "" && (facts["installed_display_version"] == "" || facts["installed_display_version"] == firewallDisplayVersion("", installed)) {
+			displayVersion, err := observedFirewallDisplayVersion(finish, tx, b.ID, b.ConnectionRev, installed)
+			if err != nil {
+				return err
+			}
+			facts["installed_display_version"] = displayVersion
+		}
 		if _, err := tx.ExecContext(finish, `UPDATE firewall_maintenance SET stage_path=?,sha256=?,architecture=? WHERE job_id=?`, result.StagedPath, result.SHA256, arch, job.ID); err != nil {
 			return err
 		}
@@ -537,12 +642,27 @@ func (c *Control) finishFirewallMaintenance(ctx context.Context, job Job, b bind
 				return err
 			}
 			resolution := "success"
-			if facts["firewall_status"] == "uninstalled" && entry.action == "install" {
+			if entry.superseded || facts["firewall_status"] == "uninstalled" && firewallInstallerAction(entry.action) == "install" {
 				resolution = "canceled"
 			}
-			verified, err := json.Marshal(map[string]string{
+			verifiedFacts := map[string]string{
 				"firewall_status": facts["firewall_status"], "staging_cleaned": strconv.FormatBool(entry.path != ""),
-			})
+			}
+			if entry.action == "update" && resolution == "success" && result.Version != "" {
+				verifiedFacts["installed_version"] = result.Version
+				verifiedFacts["installed_display_version"] = facts["installed_display_version"]
+				if entry.version == result.Version {
+					verifiedFacts["requested_version"] = entry.version
+					if entry.displayVersion != "" {
+						verifiedFacts["installed_display_version"] = entry.displayVersion
+						verifiedFacts["requested_display_version"] = entry.displayVersion
+						if action == "verify" {
+							facts["installed_display_version"] = entry.displayVersion
+						}
+					}
+				}
+			}
+			verified, err := json.Marshal(verifiedFacts)
 			if err != nil {
 				return err
 			}
@@ -586,6 +706,25 @@ func (c *Control) finishFirewallMaintenance(ctx context.Context, job Job, b bind
 	return status, err
 }
 
+// Existing jobs can predate the version label fix. Reuse the binding's
+// observed Imon version only for the same installed helper digest.
+func refreshFirewallJobVersionLabel(ctx context.Context, tx *sql.Tx, job *Job) error {
+	digest := job.Results["installed_version"]
+	label := job.Results["installed_display_version"]
+	if digest == "" || (label != "" && label != firewallDisplayVersion("", digest)) {
+		return nil
+	}
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT connection_rev FROM firewall_maintenance WHERE job_id=?`, job.ID).Scan(&revision); err != nil {
+		return err
+	}
+	displayVersion, err := observedFirewallDisplayVersion(ctx, tx, job.TargetID, revision, digest)
+	if err == nil {
+		job.Results["installed_display_version"] = displayVersion
+	}
+	return err
+}
+
 func (c *Control) firewallDetails(ctx context.Context, tx *sql.Tx, id string, details *firewallJob) (string, error) {
 	var collectorUser, targetID string
 	var revision int64
@@ -598,15 +737,17 @@ func (c *Control) firewallDetails(ctx context.Context, tx *sql.Tx, id string, de
 		return "", err
 	}
 	if sameBinding && status == "awaiting_admin" && details.StagePath != "" {
-		details.Command = collector.FirewallAdminCommand(details.Action, collectorUser, details.StagePath, details.SHA256)
+		details.Command = collector.FirewallAdminCommand(firewallInstallerAction(details.Action), collectorUser, details.StagePath, details.SHA256)
 	}
 	if details.arch != "" {
-		if details.SHA256 == "" {
-			details.DownloadPath = "/api/v1/jobs/" + id + "/firewall-script"
-		} else if _, err := firewallScriptForJob(details.arch, details.SHA256); err == nil {
-			details.DownloadPath = "/api/v1/jobs/" + id + "/firewall-script"
+		if details.Action != "update" || details.StagePath != "" || errorCode == collector.FirewallMigrationRequired {
+			if details.SHA256 == "" {
+				details.DownloadPath = "/api/v1/jobs/" + id + "/firewall-script"
+			} else if _, err := firewallScriptForJob(details.arch, details.SHA256); err == nil {
+				details.DownloadPath = "/api/v1/jobs/" + id + "/firewall-script"
+			}
 		}
-		if sameBinding && status == "failed" && errorCode == collector.FirewallAdministratorRequired {
+		if sameBinding && status == "failed" && (errorCode == collector.FirewallAdministratorRequired || errorCode == collector.FirewallMigrationRequired) {
 			details.ManualUploadAvailable, err = firewallUploadEligible(ctx, tx, id, targetID, revision, details.Action)
 			if err != nil {
 				return "", err
@@ -614,6 +755,15 @@ func (c *Control) firewallDetails(ctx context.Context, tx *sql.Tx, id string, de
 		}
 	}
 	return collectorUser, nil
+}
+
+// Only initial installation and one-time migration use the privileged
+// installer. Normal updates dispatch the helper's separate update command.
+func firewallInstallerAction(action string) string {
+	if action == "update" {
+		return "install"
+	}
+	return action
 }
 
 func firewallScriptForJob(arch, expected string) ([]byte, error) {
@@ -636,6 +786,10 @@ func (c *Control) downloadFirewall(w http.ResponseWriter, r *http.Request) {
 	err := c.db.Read(ctx, func(tx *sql.Tx) error { _, err := c.firewallDetails(ctx, tx, r.PathValue("id"), &details); return err })
 	if err != nil {
 		report(w, err)
+		return
+	}
+	if details.Action == "update" && details.DownloadPath == "" {
+		report(w, store.ErrNotFound)
 		return
 	}
 	script, err := firewallScriptForJob(details.arch, details.SHA256)

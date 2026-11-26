@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"imon/internal/firewall"
 	"imon/internal/store"
 )
 
@@ -97,6 +98,40 @@ func TestServiceResourceSortingAndPagination(t *testing.T) {
 	queryAPI(t, mux, "/api/v1/services?sort=unsupported", 400, nil)
 }
 
+func TestHostServicesUseDedicatedGrantOnlyForListedUnits(t *testing.T) {
+	db, mux := queryFixture(t)
+	queryTarget(t, db, "host-fixture", "host", 1)
+	publishQuerySnapshot(t, db, "host-fixture", "systemd", "host-services",
+		store.SnapshotRow{ObjectKey: "valid.service", Payload: json.RawMessage(`{"name":"valid.service","state":"running"}`)},
+		store.SnapshotRow{ObjectKey: "other.service", Payload: json.RawMessage(`{"name":"other.service","state":"running"}`)})
+	type page struct {
+		Items []service `json:"items"`
+	}
+	read := func() []service {
+		t.Helper()
+		var got page
+		queryAPI(t, mux, "/api/v1/services?sort=name", 200, &got)
+		if len(got.Items) != 2 {
+			t.Fatalf("unexpected services: %+v", got)
+		}
+		return got.Items
+	}
+	before := read()
+	if !before[0].Authorized || !before[0].UsesHostLogin || !before[1].Authorized || !before[1].UsesHostLogin {
+		t.Fatalf("services didn't use the bound login: %+v", before)
+	}
+	objects, err := json.Marshal([]string{before[1].ID})
+	queryOK(t, err)
+	queryOK(t, db.Write(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO service_authorizations VALUES(?,?,?,?)`, "host-fixture", 1, "{}", string(objects))
+		return err
+	}))
+	after := read()
+	if !after[0].Authorized || !after[0].UsesHostLogin || !after[1].Authorized || after[1].UsesHostLogin {
+		t.Fatalf("credentials didn't follow the dedicated grant: %+v", after)
+	}
+}
+
 func TestTargetsFilterAndCurrentProbe(t *testing.T) {
 	db, mux := queryFixture(t)
 	queryTarget(t, db, "a-cluster", "cluster", 1)
@@ -121,11 +156,24 @@ func TestTargetsFilterAndCurrentProbe(t *testing.T) {
 	}
 	var first, last page
 	queryAPI(t, mux, "/api/v1/targets?kind=host&limit=1", 200, &first)
+	available, _ := firewall.Version("amd64")
 	if len(first.Items) != 1 || first.Items[0].ID != "b-host" || first.Next != "b-host" ||
 		first.Items[0].ConnectionStatus != "unreachable" || first.Items[0].ErrorCode != "authentication_failed" ||
 		first.Items[0].ProbeObservedAt == nil || *first.Items[0].ProbeObservedAt != 100 ||
-		first.Items[0].FirewallStatus != "readable" || first.Items[0].FirewallAuthorizationStatus != "installed" {
+		first.Items[0].FirewallStatus != "readable" || first.Items[0].FirewallAuthorizationStatus != "installed" ||
+		first.Items[0].HostAuthorizationUpdateAvailable != (available != "") {
 		t.Fatalf("unexpected first host page: %+v", first)
+	}
+	if available != "" {
+		queryOK(t, db.Write(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE firewall_authorization_observations SET version=? WHERE target_id='b-host'`, available)
+			return err
+		}))
+		var current targetDetail
+		queryAPI(t, mux, "/api/v1/targets/b-host", 200, &current)
+		if current.FirewallAuthorizationStatus != "installed" || current.HostAuthorizationUpdateAvailable {
+			t.Fatalf("current helper marked as updatable: %+v", current)
+		}
 	}
 	queryAPI(t, mux, "/api/v1/targets?kind=host&limit=1&cursor="+url.QueryEscape(first.Next), 200, &last)
 	if len(last.Items) != 1 || last.Items[0].ID != "d-host" || last.Next != "" || last.Items[0].ConnectionStatus != "pending" || last.Items[0].ProbeObservedAt != nil || last.Items[0].FirewallAuthorizationStatus != "" {

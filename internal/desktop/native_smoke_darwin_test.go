@@ -38,7 +38,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "desktop panel smoke:", err)
 		os.Exit(1)
 	}
-	fmt.Println("desktop panel smoke: default hosts page, in-place services navigation and version v0.1.0 passed")
+	fmt.Println("desktop panel smoke: default hosts page, in-place services navigation and version popover links passed")
 	os.Exit(m.Run())
 }
 
@@ -140,6 +140,16 @@ func smokePanel() (err error) {
     if (!location.hash.startsWith("#?view=services")) throw Error("Services did not use the desktop route");
     history.back();
     await until(() => page("主机管理"));
+    await until(() => !updateDot.hidden);
+    versionTrigger.click();
+    const expected = ["https://github.com/fixture/imon/releases/tag/v0.2.0",
+      "https://github.com/fixture/imon/releases/download/v0.2.0/imon-desktop.zip",
+      "https://github.com/fixture/imon/releases"];
+    const links = [...versionPopover.querySelectorAll("a")];
+    if (versionPopover.hidden || links.length !== expected.length ||
+        links.some((link, index) => link.href !== expected[index] || link.hasAttribute("target"))) {
+      throw Error("desktop version links must use normal navigation to GitHub");
+    }
   } catch (e) {
     outcome = String(e);
   }
@@ -147,6 +157,12 @@ func smokePanel() (err error) {
 })();`)...)
 	outcomes := make(chan string, 1)
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/version/update", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"current":"v0.1.0","tag":"v0.2.0","state":"available","repository":"fixture/imon",
+			"repository_url":"https://github.com/fixture/imon/releases",
+			"release_url":"https://github.com/fixture/imon/releases/tag/v0.2.0",
+			"asset_url":"https://github.com/fixture/imon/releases/download/v0.2.0/imon-desktop.zip"}`)
+	})
 	mux.HandleFunc("POST /api/v1/smoke-finish", func(w http.ResponseWriter, r *http.Request) {
 		var result struct {
 			Outcome string `json:"outcome"`

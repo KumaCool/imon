@@ -221,6 +221,7 @@ gboolean load_failed(WebKitWebView *, WebKitLoadEvent, const char *uri, GError *
 
 int infra_gtk_run(uintptr_t handle, const char *proof, const void *index, size_t index_length,
                   const void *style, size_t style_length, const void *script, size_t script_length) {
+  g_set_prgname("imon");
   webview_t webview = webview_create(0, nullptr);
   if (!webview) return -1;
   auto *view = WEBKIT_WEB_VIEW(webview_get_native_handle(webview, WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER));
@@ -229,6 +230,7 @@ int infra_gtk_run(uintptr_t handle, const char *proof, const void *index, size_t
     webview_destroy(webview);
     return -1;
   }
+  gtk_window_set_icon_name(window, "imon");
   Session session{handle, proof, {g_bytes_new(index, index_length), g_bytes_new(style, style_length),
                                   g_bytes_new(script, script_length)}, view, window, nullptr, 0, 0, false};
   current = &session;

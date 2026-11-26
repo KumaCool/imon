@@ -420,6 +420,8 @@ func TestMaintenanceStagesPrivatelyWithoutExecution(t *testing.T) {
 		switch command {
 		case hostProbeCommand:
 			return 0
+		case autoMaintenanceProbe:
+			return 126
 		case stageOnlyCommand:
 			staged, err := io.ReadAll(input)
 			if err != nil || string(staged) != string(script) {
@@ -523,7 +525,7 @@ func TestMaintenanceVerifiesUninstallationOnlyWithAdminEvidence(t *testing.T) {
 		case command == inspectFirewallCommand:
 			_, _ = io.WriteString(channel, "markers-absent\n")
 			return 0
-		case command == "sudo -n -- /usr/bin/id -u":
+		case command == autoMaintenanceProbe:
 			_, _ = io.WriteString(channel, "0\n")
 			return 0
 		case strings.HasPrefix(command, "imon_payload | sudo -n -- /bin/sh -c ") && strings.Contains(command, "verify --collector demo"):

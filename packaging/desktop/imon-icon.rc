@@ -1,0 +1,3 @@
+#include "../../internal/desktop/windows_icon.h"
+
+IMON_APP_ICON ICON "imon.ico"

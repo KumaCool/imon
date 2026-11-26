@@ -10,13 +10,13 @@ usage() {
 tag=$1
 case "$tag" in *[!v.0123456789]*) usage ;; esac
 printf '%s\n' "$tag" | LC_ALL=C grep -Eq '^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$' || usage
-repo=${3:-}
-if [ -n "$repo" ]; then
-  case "$repo" in */.|*/..|*[!a-zA-Z0-9_./-]*) usage ;; esac
-  printf '%s\n' "$repo" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]{0,39}/[A-Za-z0-9_.-]{1,100}$' || usage
-fi
-
 src=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)
+# A present third argument also allows an explicitly disconnected build.
+if [ "$#" -eq 3 ]; then
+  repo=$(sh "$src/packaging/release/repository.sh" "$src" "$3")
+else
+  repo=$(sh "$src/packaging/release/repository.sh" "$src")
+fi
 out_parent=${2:-"$src/dist"}
 go_bin=$(command -v "${GO_BIN:-go}")
 case "$go_bin" in /*) ;; *) go_bin="$(pwd)/$go_bin" ;; esac
@@ -44,15 +44,9 @@ trap 'exit 1' HUP INT TERM
 mkdir "$work/src" "$work/assets" "$work/package"
 cp "$src/go.mod" "$src/go.sum" "$work/src/"
 cp -R "$src/cmd" "$src/internal" "$src/web" "$work/src/"
+sh "$src/packaging/release/build-helpers.sh" "$tag" "$go_bin" "$work/src"
 cd "$work/src"
 export GOFLAGS='' GOWORK=off CGO_ENABLED=0 GOAMD64=v1 GOARM64=v8.0
-for arch in amd64 arm64; do
-  printf 'Building Linux firewall reader (%s)\n' "$arch"
-  GOOS=linux GOARCH="$arch" "$go_bin" build -buildvcs=false -trimpath -ldflags='-s -w' \
-    -o "internal/firewall/bundles/firewall-read-$arch" ./cmd/imon-firewall
-done
-GOOS=$("$go_bin" env GOHOSTOS) GOARCH=$("$go_bin" env GOHOSTARCH) \
-  IMON_REQUIRE_BUNDLES=1 "$go_bin" test -count=1 ./internal/firewall
 
 linker="-s -w -X main.version=$tag"
 if [ -n "$repo" ]; then

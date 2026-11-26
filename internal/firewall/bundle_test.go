@@ -48,7 +48,8 @@ func TestEmbeddedReleaseBundles(t *testing.T) {
 			}
 			content := string(script)
 			if !strings.Contains(content, fmt.Sprintf("\nwanted=%x\n", sha256.Sum256(binary))) ||
-				strings.Contains(content, "@BINARY_SHA256@") || strings.Contains(content, "@FIREWALL_BINARY@") {
+				strings.Contains(content, "@BINARY_SHA256@") || strings.Contains(content, "@FIREWALL_BINARY@") ||
+				strings.Contains(content, "@HELPER_RELEASE@") || strings.Contains(content, "@HELPER_UPDATE_KEY@") {
 				t.Fatal("generated script does not contain a resolved reader checksum and payload")
 			}
 			_, rest, found := strings.Cut(content, "<<'IMON_BINARY'\n")
@@ -59,6 +60,23 @@ func TestEmbeddedReleaseBundles(t *testing.T) {
 			decoded, err := base64.StdEncoding.DecodeString(payload)
 			if err != nil || !bytes.Equal(binary, decoded) {
 				t.Fatal("generated script does not reproduce the bundled reader")
+			}
+			metadata, signed, err := signedUpdate(target.arch, binary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			update, updateErr := UpdatePackage(target.arch)
+			if signed == nil {
+				if os.Getenv("IMON_REQUIRE_SIGNED_HELPERS") == "1" || updateErr == nil {
+					t.Fatalf("no signed update for %s: %v", target.arch, updateErr)
+				}
+			} else {
+				if updateErr != nil || !bytes.Equal(update, signed) {
+					t.Fatalf("unavailable signed update: %v", updateErr)
+				}
+				if !strings.Contains(content, metadata.PublicKey) || !strings.Contains(content, metadata.Release) {
+					t.Fatal("installer is missing signed helper metadata")
+				}
 			}
 		})
 	}

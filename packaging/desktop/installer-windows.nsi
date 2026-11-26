@@ -8,6 +8,8 @@ Unicode true
 !define RUNTIME_KEY "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 Name "${APP}"
+Icon "imon.ico"
+UninstallIcon "imon.ico"
 OutFile "${OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\Imon"
 RequestExecutionLevel user
@@ -58,6 +60,7 @@ Section "Install"
     ${EndIf}
   ${EndIf}
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${APP}"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\imon-desktop.exe,0"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1

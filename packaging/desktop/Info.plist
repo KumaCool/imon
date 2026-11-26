@@ -8,6 +8,8 @@
 	<string>Imon</string>
 	<key>CFBundleExecutable</key>
 	<string>imon-desktop</string>
+	<key>CFBundleIconFile</key>
+	<string>imon.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>org.inframonitor.desktop</string>
 	<key>CFBundleInfoDictionaryVersion</key>

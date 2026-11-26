@@ -5,7 +5,7 @@ Evergreen Runtime. It does not start the Web edition or an HTTP listener.
 
 ## Build
 
-Use Go from `go.mod`, amd64 MinGW-w64 GCC/G++, NSIS, and a POSIX shell.
+Use Go from `go.mod`, amd64 MinGW-w64 GCC/G++ and windres, NSIS, and a POSIX shell.
 Download the `Microsoft.Web.WebView2` NuGet package at version `1.0.1150.38`,
 the SDK version pinned by WebView 0.12.0, and extract its
 `build/native/include` directory. Only the headers are used; the runtime and

@@ -4,6 +4,15 @@ The desktop builds share the local monitoring runtime with the separately
 distributed Web build. They start a native window without opening a local HTTP
 service. Do not run both variants against one data directory at the same time.
 
+All three packages carry the Imon app icon. Edit `imon.svg` and run
+`./packaging/desktop/build-icons.sh` on macOS with Python 3 to regenerate the
+checked-in macOS, Windows, and Linux icon files.
+
+Set `IMON_HELPER_SIGNING_KEY_FILE` to the Ed25519 PKCS#8 PEM used for the
+Web release before running the desktop packagers. Keep using the same key
+for later releases so installed Linux helpers can verify updates. Set
+`IMON_ALLOW_UNSIGNED_HELPER=1` for a local package without helper self-updates.
+
 ## macOS
 
 Build on macOS with the repository's Go toolchain and Xcode Command Line Tools:
@@ -16,9 +25,8 @@ The default output is `dist/desktop/v0.1.0/darwin-<ARCH>/` (native architecture)
 Pass an alternate output parent and `amd64` or `arm64` as optional arguments.
 The zip contains `Imon.app`, which opens from Finder. The app has a
 local ad-hoc signature, not a Developer ID signature or notarization. The
-package declares macOS 13 as the minimum; this does not substitute for testing
-on that version. The two Linux firewall reader architectures are embedded for
-the managed hosts.
+package declares macOS 13 as the minimum. The package embeds Linux host
+helpers for amd64 and arm64.
 
 For isolated runtime testing, unpack the zip, then from the extracted directory:
 
@@ -41,11 +49,9 @@ sudo apt install ./dist/desktop/v0.1.0/linux-amd64/imon-desktop_linux_amd64.deb
 imon-desktop
 ```
 
-The `.deb` was installed, launched, and removed on Debian 12 in an isolated
-Xvfb session. The test exercised navigation and bridge reads and writes,
-confirmed that the desktop process did not listen on TCP, and verified that it
-released the data directory lock on exit. Ubuntu 24.04 and native file dialog
-interactions still need testing.
+The Debian 12 smoke test uses an isolated Xvfb session to exercise navigation,
+bridge reads and writes, and shutdown. It checks that the desktop process opens
+its window without a TCP listener and releases the data directory lock on exit.
 
 ## Windows
 

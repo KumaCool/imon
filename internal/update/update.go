@@ -67,24 +67,27 @@ type asset struct {
 }
 
 type info struct {
-	Current      string `json:"current"`
-	Repository   string `json:"repository,omitempty"`
-	State        string `json:"state"`
-	Tag          string `json:"tag,omitempty"`
-	AssetName    string `json:"asset_name,omitempty"`
-	Size         int64  `json:"size,omitempty"`
-	SHA256       string `json:"sha256,omitempty"`
-	Path         string `json:"path,omitempty"`
-	ReleaseURL   string `json:"release_url,omitempty"`
-	ReleaseName  string `json:"release_name,omitempty"`
-	ReleaseNotes string `json:"release_notes,omitempty"`
-	CanApply     bool   `json:"can_apply"`
+	Current       string `json:"current"`
+	Repository    string `json:"repository,omitempty"`
+	RepositoryURL string `json:"repository_url,omitempty"`
+	State         string `json:"state"`
+	Tag           string `json:"tag,omitempty"`
+	AssetName     string `json:"asset_name,omitempty"`
+	AssetURL      string `json:"asset_url,omitempty"`
+	Size          int64  `json:"size,omitempty"`
+	SHA256        string `json:"sha256,omitempty"`
+	Path          string `json:"path,omitempty"`
+	ReleaseURL    string `json:"release_url,omitempty"`
+	ReleaseName   string `json:"release_name,omitempty"`
+	ReleaseNotes  string `json:"release_notes,omitempty"`
+	CanApply      bool   `json:"can_apply"`
 }
 
 type Options struct {
 	Executable string
 	Install    func(*http.Request, *Replacement) error
 	RolledBack bool
+	Desktop    bool
 }
 
 // Register adds version and update endpoints to the authenticated local API.
@@ -93,23 +96,41 @@ func Register(mux *http.ServeMux, dataPath, version, repo string, options ...Opt
 	if repo != "" && !validRepo(repo) {
 		return errors.New("GitHub release repository must be owner/repo")
 	}
-	extension := ".tar.gz"
-	if runtime.GOOS == "windows" {
-		extension = ".zip"
+	var opts Options
+	if len(options) != 0 {
+		opts = options[0]
 	}
 	s := &source{
 		dataPath: dataPath, version: version, repo: repo,
-		assetName: "imon-web_" + runtime.GOOS + "_" + runtime.GOARCH + extension,
+		assetName: releaseAsset(runtime.GOOS, runtime.GOARCH, opts.Desktop),
 		client:    &http.Client{CheckRedirect: checkRedirect},
 	}
-	if len(options) != 0 {
-		s.rolledBack.Store(options[0].RolledBack)
-		if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
-			s.executable, s.install = options[0].Executable, options[0].Install
-		}
+	s.rolledBack.Store(opts.RolledBack)
+	if !opts.Desktop && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") {
+		s.executable, s.install = opts.Executable, opts.Install
 	}
 	s.register(mux)
 	return nil
+}
+
+func releaseAsset(goos, goarch string, desktop bool) string {
+	if desktop {
+		switch {
+		case goos == "darwin" && (goarch == "amd64" || goarch == "arm64"):
+			return "imon-desktop_darwin_" + goarch + ".zip"
+		case goos == "linux" && goarch == "amd64":
+			return "imon-desktop_linux_amd64.deb"
+		case goos == "windows" && goarch == "amd64":
+			return "imon-desktop_windows_amd64_setup.exe"
+		default:
+			return ""
+		}
+	}
+	extension := ".tar.gz"
+	if goos == "windows" {
+		extension = ".zip"
+	}
+	return "imon-web_" + goos + "_" + goarch + extension
 }
 
 func validRepo(repo string) bool {
@@ -140,12 +161,14 @@ func (s *source) register(mux *http.ServeMux) {
 }
 
 func (s *source) local() info {
-	state := "configured"
+	current := info{Current: s.version, Repository: s.repo, State: "unconfigured"}
 	if s.repo == "" {
-		state = "unconfigured"
+		return current
 	}
-	canApply := s.repo != "" && s.executable != "" && s.install != nil
-	return info{Current: s.version, Repository: s.repo, State: state, CanApply: canApply}
+	current.State = "configured"
+	current.RepositoryURL = "https://github.com/" + s.repo + "/releases"
+	current.CanApply = s.executable != "" && s.install != nil
+	return current
 }
 
 func (s *source) localVersion(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +246,7 @@ func (s *source) lookup(ctx context.Context) (info, error) {
 		return current, nil
 	}
 	current.Tag = remote.Tag
-	current.ReleaseURL = "https://github.com/" + s.repo + "/releases/tag/" + remote.Tag
+	current.ReleaseURL = current.RepositoryURL + "/tag/" + remote.Tag
 	current.ReleaseName = truncateText(remote.Name, 160)
 	current.ReleaseNotes = truncateText(remote.Body, 1600)
 	if installed, valid := parseVersion(s.version); valid {
@@ -234,6 +257,9 @@ func (s *source) lookup(ctx context.Context) (info, error) {
 		}
 	}
 	current.State = "asset_missing"
+	if s.assetName == "" {
+		return current, nil
+	}
 	for _, candidate := range remote.Assets {
 		if candidate.Name != s.assetName || candidate.State != "uploaded" {
 			continue
@@ -244,6 +270,7 @@ func (s *source) lookup(ctx context.Context) (info, error) {
 			return current, nil
 		}
 		current.AssetName, current.SHA256, current.Size, current.State = candidate.Name, digest, candidate.Size, "available"
+		current.AssetURL = current.RepositoryURL + "/download/" + remote.Tag + "/" + candidate.Name
 		return current, nil
 	}
 	return current, nil
@@ -408,8 +435,7 @@ func (s *source) stage(ctx context.Context, current info) (string, error) {
 	if fileMatches(destination, current) {
 		return destination, nil
 	}
-	url := "https://github.com/" + s.repo + "/releases/download/" + current.Tag + "/" + current.AssetName
-	response, err := s.request(ctx, url, "application/octet-stream")
+	response, err := s.request(ctx, current.AssetURL, "application/octet-stream")
 	if err != nil {
 		return "", err
 	}

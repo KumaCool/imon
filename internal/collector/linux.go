@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"imon/internal/systemd"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 	ipv4RoutesCommand = locale + "ip -j -4 route show table all"
 	ipv6RoutesCommand = locale + "ip -j -6 route show table all"
 	showUnitsCommand  = locale + "systemctl --no-pager show -p Id -p LoadState -p ActiveState -p SubState --"
-	firewallCommand   = locale + `
+	helperPathCommand = `
 present() { [ -e "$1" ] || [ -L "$1" ]; }
 current=/usr/local/libexec/imon/firewall-read
 legacy=/usr/local/libexec/infra-monitor/firewall-read
@@ -28,9 +30,35 @@ if present "$legacy" || present /var/lib/infra-monitor/firewall-manifest.json ||
   if present "$current" || present /var/lib/imon/firewall-manifest.json || present /etc/sudoers.d/imon-firewall; then
     exit 1
   fi
-  exec sudo -n -- "$legacy"
+  helper=$legacy
+else
+  helper=$current
+fi`
+	firewallCommand = locale + helperPathCommand + `
+exec sudo -n -- "$helper"`
+	portsHelperCommand = locale + helperPathCommand + `
+if [ -x "$helper" ]; then
+  sudo -n -- "$helper" ports 2>/dev/null && exit 0
 fi
-exec sudo -n -- "$current"`
+if [ "$(/usr/bin/id -u)" = 0 ]; then
+  prefix=''
+elif [ "$(sudo -n -- /usr/bin/id -u 2>/dev/null)" = 0 ]; then
+  prefix='sudo -n --'
+else
+  exit 126
+fi
+# Label each fixed command's output. This path supports a root-controlled
+# host that needs no auxiliary program and older helpers without ports.
+printf '%s\n' 'imon:ipv4'
+$prefix ss -H -l -n -t -u -p -4 2>/dev/null
+v4=$?
+printf '%s\n' 'imon:ipv6'
+$prefix ss -H -l -n -t -u -p -6 2>/dev/null
+v6=$?
+if [ "$v4" -ne 0 ] || [ "$v6" -ne 0 ]; then
+  printf '%s\n' 'imon:netstat'
+  $prefix netstat -lnptu 2>/dev/null || :
+fi`
 )
 
 // Keep every inventory query on one SSH channel. Disable word expansion on the
@@ -430,12 +458,10 @@ func parseDisks(data []byte) ([]Row, error) {
 	return out, nil
 }
 
-var systemdServiceUnit = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_.@:-]|\\x[0-9A-Fa-f]{2})*\.service$`)
-
 // ValidSystemdServiceUnit accepts concrete service names, including systemd's
 // escaped \xNN form, while excluding uninstantiated templates.
 func ValidSystemdServiceUnit(name string) bool {
-	return systemdServiceUnit.MatchString(name) && !strings.HasSuffix(name, "@.service")
+	return systemd.ValidUnit(name)
 }
 
 type unitStatus struct {
@@ -693,7 +719,7 @@ func parseListeners(data []byte, protocol, family string) ([]listenRecord, error
 			continue
 		}
 		item := listenRecord{Protocol: rowProtocol, Family: parsedFamily, Address: address, Port: uint16(n), ProcessState: "unreadable"}
-		if len(fields) > localIndex+2 {
+		if len(fields) > localIndex+2 && strings.HasPrefix(fields[localIndex+2], "users:((") {
 			item.Process = strings.Join(fields[localIndex+2:], " ")
 			item.ProcessState = "ok"
 		}
@@ -802,7 +828,7 @@ func normalizeListenerAddress(raw, family string) (string, bool) {
 
 func appendListenerRecords(grouped map[string]listenRecord, items []listenRecord) {
 	for _, listener := range items {
-		key := listener.Protocol + "|" + listener.Family + "|" + listener.Address + "|" + strconv.Itoa(int(listener.Port))
+		key := listenerKey(listener)
 		if old, ok := grouped[key]; ok && old.Process != "" {
 			listener.ProcessState = old.ProcessState
 			if listener.Process == "" || listener.Process == old.Process {
@@ -812,6 +838,58 @@ func appendListenerRecords(grouped map[string]listenRecord, items []listenRecord
 			}
 		}
 		grouped[key] = listener
+	}
+}
+
+func listenerKey(listener listenRecord) string {
+	return listener.Protocol + "|" + listener.Family + "|" + listener.Address + "|" + strconv.Itoa(int(listener.Port))
+}
+
+func privilegedListenerRecords(data []byte) []listenRecord {
+	var snapshot struct {
+		SS4     string `json:"ss_ipv4"`
+		SS6     string `json:"ss_ipv6"`
+		Netstat string `json:"netstat"`
+	}
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		v4, rest, ok := strings.Cut(strings.TrimPrefix(string(data), "imon:ipv4\n"), "imon:ipv6\n")
+		if !ok || !bytes.HasPrefix(data, []byte("imon:ipv4\n")) {
+			return nil
+		}
+		v6, netstat, _ := strings.Cut(rest, "imon:netstat\n")
+		snapshot.SS4, snapshot.SS6, snapshot.Netstat = v4, v6, netstat
+	}
+	v4, _ := parseListeners([]byte(snapshot.SS4), "", "ipv4")
+	v6, _ := parseListeners([]byte(snapshot.SS6), "", "ipv6")
+	netstat, _ := parseNetstatListeners([]byte(snapshot.Netstat))
+	return append(append(v4, v6...), netstat...)
+}
+
+func (s *sshConnection) enrichListeners(ctx context.Context, grouped map[string]listenRecord) {
+	missing := false
+	for _, listener := range grouped {
+		if listener.Process == "" {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
+	defer cancel()
+	data, err := s.run(readCtx, portsHelperCommand)
+	if err != nil {
+		return
+	}
+	enriched := make(map[string]listenRecord)
+	appendListenerRecords(enriched, privilegedListenerRecords(data))
+	for key, listener := range grouped {
+		if privileged, ok := enriched[key]; ok && privileged.Process != "" && listener.Process == "" {
+			listener.Process = privileged.Process
+			listener.ProcessState = privileged.ProcessState
+			grouped[key] = listener
+		}
 	}
 }
 
@@ -905,6 +983,7 @@ func (s *sshConnection) listeners(ctx context.Context) ([]Row, error) {
 			appendListenerRecords(grouped, items)
 		}
 	}
+	s.enrichListeners(ctx, grouped)
 	return listenerRows(grouped)
 }
 
@@ -952,15 +1031,9 @@ func (s *sshConnection) firewall(ctx context.Context) ([]Row, error) {
 // returns native=false when the identity cannot prove that capability, so the
 // installed read-only helper remains the fallback for ordinary accounts.
 func (s *sshConnection) nativeFirewall(ctx context.Context) ([]Row, bool, error) {
-	probe := locale + "id -u"
-	output, err := s.runLimited(ctx, probe, 1024)
-	prefix := ""
-	if err != nil || strings.TrimSpace(string(output)) != "0" {
-		output, err = s.runLimited(ctx, locale+"sudo -n -- id -u", 1024)
-		if err != nil || strings.TrimSpace(string(output)) != "0" {
-			return nil, false, nil
-		}
-		prefix = "sudo -n -- "
+	prefix, native := s.nativeRoot(ctx)
+	if !native {
+		return nil, false, nil
 	}
 
 	command := func(name string, args ...string) ([]byte, error) {
@@ -1037,4 +1110,16 @@ func (s *sshConnection) nativeFirewall(ctx context.Context) ([]Row, bool, error)
 	}
 	rows = append(rows, legacyRow)
 	return rows, true, nil
+}
+
+func (s *sshConnection) nativeRoot(ctx context.Context) (prefix string, native bool) {
+	output, err := s.runLimited(ctx, locale+"id -u", 1024)
+	if err == nil && strings.TrimSpace(string(output)) == "0" {
+		return "", true
+	}
+	output, err = s.runLimited(ctx, locale+"sudo -n -- id -u", 1024)
+	if err == nil && strings.TrimSpace(string(output)) == "0" {
+		return "sudo -n -- ", true
+	}
+	return "", false
 }

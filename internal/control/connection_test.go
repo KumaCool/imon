@@ -146,6 +146,8 @@ func TestUnbindHostRequiresVerifiedFirewallRemoval(t *testing.T) {
 	digest := "8645c" + strings.Repeat("a", 59)
 	remote.Store("installed " + digest)
 	var detectionCalls atomic.Int32
+	var selfUninstallAllowed atomic.Bool
+	var selfUninstalls atomic.Int32
 	endpoint, sshServer, auth, fingerprint := bindingSSHFixture(t, clientKey, "", func(command string) string {
 		switch {
 		case strings.Contains(command, "markers-absent"):
@@ -153,6 +155,14 @@ func TestUnbindHostRequiresVerifiedFirewallRemoval(t *testing.T) {
 			return remote.Load().(string) + "\n"
 		case strings.Contains(command, "/usr/bin/uname -m"):
 			return "x86_64\n"
+		case strings.Contains(command, `sudo -n -- "$helper" uninstall`):
+			if !selfUninstallAllowed.Load() {
+				return "imon:helper-exit 1\n"
+			}
+			selfUninstalls.Add(1)
+			// The non-root account can't inspect the sudoers directory.
+			remote.Store("markers-absent")
+			return "uninstalled\n"
 		case strings.Contains(command, "/firewall-read"):
 			return `[{"backend":"nftables","status":"ok"}]`
 		default:
@@ -224,9 +234,8 @@ func TestUnbindHostRequiresVerifiedFirewallRemoval(t *testing.T) {
 	if count := detectionCalls.Load(); count != 2 || !strings.Contains(response.Body.String(), `"installed_display_version":"v0.2.0 8645c"`) {
 		t.Fatalf("new connection did not get a fresh observation: probes=%d body=%s", count, response.Body.String())
 	}
-	del := func(wantStatus string, codes ...string) {
+	waitRemoval := func(response *httptest.ResponseRecorder, wantStatus string, unbound bool, codes ...string) {
 		t.Helper()
-		response := collectionHTTP(t, mux, "DELETE", "/api/v1/targets/fixture?confirm_unknown=true", "", 202)
 		id := firewallJobID(t, response.Body.Bytes())
 		var job struct {
 			Status      string            `json:"status"`
@@ -243,12 +252,18 @@ func TestUnbindHostRequiresVerifiedFirewallRemoval(t *testing.T) {
 				break
 			}
 		}
-		if job.Status != wantStatus || len(codes) > 0 && !slices.Contains(codes, job.Error) || (job.Results["unbound"] == "true") != (wantStatus == "success") {
-			t.Fatalf("unbind job: %+v", job)
+		if job.Status != wantStatus || len(codes) > 0 && !slices.Contains(codes, job.Error) || (job.Results["unbound"] == "true") != unbound ||
+			(wantStatus == "success" && job.Results["cleanup_confirmed"] != "true") {
+			t.Fatalf("removal job: status=%q code=%q facts=%v", job.Status, job.Error, job.Results)
 		}
-		if _, err := c.target(t.Context(), "fixture"); (err == nil) != (wantStatus != "success") {
+		if _, err := c.target(t.Context(), "fixture"); (err != nil) != unbound {
 			t.Fatalf("binding lookup after %q: %v", job.Status, err)
 		}
+	}
+	del := func(wantStatus string, codes ...string) {
+		t.Helper()
+		response := collectionHTTP(t, mux, "DELETE", "/api/v1/targets/fixture?confirm_unknown=true", "", 202)
+		waitRemoval(response, wantStatus, wantStatus == "success", codes...)
 	}
 	del("failed", collector.FirewallAdministratorRequired, "maintenance_package_unavailable")
 	remote.Store("markers-absent")
@@ -263,8 +278,20 @@ func TestUnbindHostRequiresVerifiedFirewallRemoval(t *testing.T) {
 	})
 	seedFirewallJob(t, c, "pending", "fixture", "install", "awaiting_admin", "", map[string]string{})
 	del("failed", collector.FirewallAdministratorRequired, "maintenance_package_unavailable")
-	remote.Store("uninstalled")
+	remote.Store("installed " + digest)
+	selfUninstallAllowed.Store(true)
+	response = collectionHTTP(t, mux, "POST", "/api/v1/hosts/fixture/firewall-maintenance", `{"action":"uninstall"}`, 202)
+	waitRemoval(response, "success", false)
+	var authorizationAfterRemoval firewallAuthorizationState
+	queryAPI(t, mux, "/api/v1/hosts/fixture/firewall-authorization", 200, &authorizationAfterRemoval)
+	if authorizationAfterRemoval.Status != "uninstalled" || authorizationAfterRemoval.UpdateAvailable {
+		t.Fatalf("authorization summary after uninstall = %+v", authorizationAfterRemoval)
+	}
+	remote.Store("installed " + digest)
 	del("success")
+	if got := selfUninstalls.Load(); got != 2 {
+		t.Fatalf("self-uninstall calls = %d; want 2", got)
+	}
 }
 
 func bindingSSHServer(t *testing.T, user ssh.PublicKey, auth *atomic.Int32) (*ssh.ServerConfig, string) {

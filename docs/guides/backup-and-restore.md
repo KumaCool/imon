@@ -78,15 +78,15 @@ Set-Location -LiteralPath '<EXTRACT_DIR>'
 
 ## 更新
 
-正式发布的 Web 包已预设 GitHub Releases 仓库。如果使用本地构建，可在启动时使用 `--release-repo '<GITHUB_OWNER>/<GITHUB_REPO>'` 指定公开的发布仓库。客户端每次启动后首次打开面板时检查一次更新。有新版本时，侧栏底部的版本号显示红点，点击可查看发布说明和 GitHub 发布页。
+发布脚本为 Web 版和桌面版预设公开的 GitHub Releases 仓库。也可通过启动参数 `--release-repo '<GITHUB_OWNER>/<GITHUB_REPO>'` 指定仓库。客户端每次启动后首次打开面板时检查一次更新。点击侧栏底部的版本号可查看更新来源。有新版本时，版本号显示红点，气泡同时显示发布说明和对应的 GitHub 发布页。
 
-在 macOS 和 Linux 上点击 [更新]，应用下载并校验发布包、备份 SQLite、替换当前程序并自动重启。原面板在同一地址和会话中重新连接。新版本启动失败时，程序回退到旧版本及对应的数据状态并在面板报告结果。
+在 macOS 和 Linux 的 Web 版点击 [更新]，应用下载并校验发布包、备份 SQLite、替换当前程序并自动重启。原面板在同一地址和会话中重新连接。新版本启动失败时，程序回退到旧版本及对应的数据状态并在面板报告结果。
 
-Windows 或不可进行原地替换的安装位置可从气泡打开 GitHub 发布页，按前面的安装步骤校验并解压新包。手动更新前先备份数据、保留旧程序并退出当前客户端；使用过自定义数据目录时，仍传入同一个 `--data-dir`。手动回退时，停止新进程，用旧版客户端恢复升级前的备份，再启动旧版。
+桌面版和 Windows Web 版可从气泡下载本机对应的发布包，也可打开 GitHub 发布页。手动更新前先备份数据、保留旧程序并退出当前客户端。使用过自定义数据目录时，仍传入同一个 `--data-dir`。手动回退时，停止新进程，用旧版客户端恢复升级前的备份，再启动旧版。
 
 ## 维护者构建发行包
 
-在 macOS 或 Linux 从项目根目录执行，使用项目 `go.mod` 声明的 Go 工具链、`tar`、`zip` 和 SHA-256 工具。第三个参数可预设公开的 GitHub 发行仓库，作为客户端检查更新的来源。
+在 macOS 或 Linux 从项目根目录执行，使用项目 `go.mod` 声明的 Go 工具链、`tar`、`zip` 和 SHA-256 工具。可用第三个参数指定 Web 版的公开发行仓库。各平台构建脚本也接受 `IMON_RELEASE_REPO`，随后依次查找 `GITHUB_REPOSITORY` 和 GitHub `origin` 仓库。将 `IMON_RELEASE_REPO` 显式设置为空可关闭默认在线更新来源。
 
 ```sh
 ./packaging/release/build.sh '<VERSION_TAG>' '<OUTPUT_DIRECTORY>' '<GITHUB_OWNER>/<GITHUB_REPO>'

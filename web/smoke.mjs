@@ -55,6 +55,7 @@ const channels = { panel: true, telegram: false, email: false };
 const unconfirmed = { code: "result_unconfirmed", message: "上一项远端操作结果待核实" };
 const execDigest = "a".repeat(64);
 const release = { current: "v1.1.0", repository: "fixture/imon", tag: "v1.2.0", state: "available",
+  repository_url: "https://github.com/fixture/imon/releases",
   release_url: "https://github.com/fixture/imon/releases/tag/v1.2.0", release_name: "Fixture release",
   release_notes: "<em>Plain release notes</em>", can_apply: true,
   asset_name: "imon-web_linux_amd64.tar.gz", size: 4096, sha256: "b".repeat(64) };
@@ -82,12 +83,17 @@ let initialHostCollection = false;
 let hostBindingJobState = "running";
 const oldFirewallVersion = "a".repeat(64);
 const newFirewallVersion = "b".repeat(64);
+const firewallUpdateVersions = { installed_version: oldFirewallVersion, requested_version: newFirewallVersion,
+  installed_display_version: "v0.1.0 aaaaa", requested_display_version: "v1.1.0 bbbbb" };
 let firewallVersion = oldFirewallVersion;
 let firewallReachable = true;
 let firewallUninstalled = false;
 let uninstallCommandApplied = false;
 let installPendingVerification = false;
+let helperNeedsMigration = true;
+let helperUpdateCompleted = false;
 let serviceCollectionProblem;
+let serviceScrollFixture;
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, "http://127.0.0.1");
   const path = url.pathname;
@@ -169,13 +175,16 @@ const server = createServer(async (request, response) => {
   }
   if (path === "/api/v1/services") {
     if (serviceCollectionProblem) return json(list([]));
-    const filtered = [service, deployment].filter((item) => (!q.has("source") || item.source === q.get("source"))
+    const filtered = (serviceScrollFixture || [service, deployment]).filter((item) => (!q.has("source") || item.source === q.get("source"))
       && (!q.has("host_id") || item.target_id === q.get("host_id"))
       && (!q.has("q") || item.name.includes(q.get("q"))));
     const field = { name: "name", target: "target_name", state: "state", cpu: "cpu_percent", memory: "memory_bytes" }[q.get("sort")] || "name";
     const order = q.get("direction") === "desc" ? -1 : 1;
     filtered.sort((a, b) => a[field] === b[field] ? 0 : a[field] == null ? 1 : b[field] == null ? -1 : (a[field] < b[field] ? -1 : 1) * order);
-    return json(list(filtered));
+    const offset = Number(q.get("cursor") || 0);
+    const end = offset + Number(q.get("limit") || 50);
+    if (serviceScrollFixture && offset) await new Promise((resolve) => setTimeout(resolve, 250));
+    return json(list(filtered.slice(offset, end), { next_cursor: end < filtered.length ? String(end) : "" }));
   }
   if (path === "/api/v1/services/service-fixture") return json(service);
   if (path === "/api/v1/services/service-fixture/actions") {
@@ -195,9 +204,11 @@ const server = createServer(async (request, response) => {
   }
   if (path === `/api/v1/hosts/${host.id}/firewall-authorization`) {
     return json({ status: firewallVersion ? "installed" : "uninstalled",
+      installed_version: firewallVersion, available_version: newFirewallVersion,
       installed_display_version: firewallVersion ? `v0.1.0 ${firewallVersion.slice(0, 5)}` : "",
       available_display_version: "v0.1.0 bbbbb",
       update_available: Boolean(firewallVersion) && firewallVersion !== newFirewallVersion,
+      up_to_date: firewallVersion === newFirewallVersion,
       firewall_authorization_status: host.firewall_authorization_status });
   }
   if (path === `/api/v1/hosts/${host.id}/firewall-maintenance`) {
@@ -209,27 +220,54 @@ const server = createServer(async (request, response) => {
       return json({ job_id: cleanup ? "verify-uninstalled-fixture"
         : installation ? "verify-installed-fixture" : "verify-fixture" }, 202);
     }
-    if (body.action === "install") return json({ job_id: "firewall-install-fixture" }, 202);
+    if (body.action === "install") {
+      return json({ job_id: "firewall-install-fixture" }, 202);
+    }
+    if (body.action === "update") {
+      const job = helperNeedsMigration ? "firewall-migration-fixture" : "firewall-update-fixture";
+      return json({ job_id: job }, 202);
+    }
     if (body.credential_ref) {
       firewallVersion = "";
       firewallUninstalled = true;
       return json({ job_id: "firewall-uninstall-admin-fixture" }, 202);
+    }
+    if (firewallVersion === newFirewallVersion) {
+      return json({ job_id: "firewall-uninstall-auto-fixture" }, 202);
     }
     return json({ job_id: "firewall-uninstall-fixture" }, 202);
   }
   if (path === "/api/v1/jobs/firewall-install-fixture") {
     return json({ job_id: path.split("/").at(-1), status: "failed", error_code: "administrator_required", manual_upload_available: true });
   }
+  if (path === "/api/v1/jobs/firewall-migration-fixture") {
+    return json({ job_id: path.split("/").at(-1), status: "failed", error_code: "helper_migration_required", manual_upload_available: true,
+      results: firewallUpdateVersions });
+  }
+  if (path === "/api/v1/jobs/firewall-update-fixture") {
+    if (!helperUpdateCompleted) return json({ job_id: "firewall-update-fixture", status: "running" });
+    firewallVersion = newFirewallVersion;
+    host.host_authorization_update_available = false;
+    host.host_authorization_up_to_date = true;
+    return json({ job_id: "firewall-update-fixture", status: "success",
+      results: { firewall_status: "installed", installed_version: newFirewallVersion, requested_version: newFirewallVersion } });
+  }
   if (path === "/api/v1/jobs/firewall-install-upload-fixture") {
     return json({ job_id: path.split("/").at(-1), status: "awaiting_admin", stage_path: "/<STAGE>/firewall-maintain.sh",
       sha256: "c".repeat(64), command: "sudo -- /bin/sh '/<STAGE>/firewall-maintain.sh install'", download_path: "/api/v1/jobs/firewall-install-upload-fixture/firewall-script" });
   }
   if (path === "/api/v1/jobs/verify-installed-fixture") {
+    firewallVersion = newFirewallVersion;
     host.firewall_authorization_status = "installed";
+    host.host_authorization_up_to_date = true;
     return json({ job_id: path.split("/").at(-1), status: "success", results: { firewall_status: "installed", installed_version: newFirewallVersion } });
   }
-  if (path === "/api/v1/jobs/firewall-uninstall-admin-fixture") {
+  if (["firewall-uninstall-auto-fixture", "firewall-uninstall-admin-fixture"].some((id) => path === `/api/v1/jobs/${id}`)) {
+    firewallVersion = "";
+    firewallUninstalled = true;
     host.firewall_authorization_status = "uninstalled";
+    delete host.host_authorization_up_to_date;
+    delete host.host_authorization_update_available;
     return json({ job_id: path.split("/").at(-1), status: "success", results: { firewall_status: "uninstalled", cleanup_confirmed: "true" } });
   }
   if (path === "/api/v1/jobs/firewall-uninstall-fixture") {
@@ -243,7 +281,15 @@ const server = createServer(async (request, response) => {
   }
   if (path === `/api/v1/targets/${host.id}/maintenance/upload` && method === "POST") {
     if (body.action === "install") installPendingVerification = true;
+    if (body.action === "update") return json({ job_id: "firewall-migration-upload-fixture" }, 202);
     return json({ job_id: body.action === "install" ? "firewall-install-upload-fixture" : "firewall-upload-fixture" }, 202);
+  }
+  if (path === "/api/v1/jobs/firewall-migration-upload-fixture") {
+    helperNeedsMigration = false;
+    installPendingVerification = true;
+    return json({ job_id: path.split("/").at(-1), status: "awaiting_admin", stage_path: "/<STAGE>/firewall-maintain.sh",
+      sha256: "c".repeat(64), command: `sudo -- /bin/sh '/<STAGE>/firewall-maintain.sh' install ${"c".repeat(64)}`,
+      results: firewallUpdateVersions });
   }
   if (path === "/api/v1/jobs/firewall-upload-fixture") {
     return json({ job_id: "firewall-upload-fixture", status: "awaiting_admin", stage_path: "/<STAGE>/firewall-maintain.sh",
@@ -315,7 +361,7 @@ const server = createServer(async (request, response) => {
   if (path === "/api/v1/hosts/host-fixture/network/interfaces") return json(snapshot([
     ["fixture-if", { name: "fixture-if", state: "UP", mtu: 1500, addresses: [{ local: "192.0.2.10", prefixlen: 24 }] }],
   ]));
-  if (path === "/api/v1/hosts/host-fixture/network/listeners") return json(snapshot([
+  if (targets.some(({ id, kind }) => kind === "host" && path === `/api/v1/hosts/${id}/network/listeners`)) return json(snapshot([
     ["fixture-port", { protocol: "tcp", address: "192.0.2.10", port: 8080, process_state: "unreadable" }],
   ]));
   if (path === "/api/v1/hosts/host-fixture/network/routes") return json(snapshot([
@@ -353,7 +399,8 @@ const server = createServer(async (request, response) => {
     if (method === "PUT") Object.assign(channels, body);
     return json(channels);
   }
-  if (path === "/api/v1/version") return json({ current: updateApplied ? release.tag : release.current, repository: release.repository, state: "configured" });
+  if (path === "/api/v1/version") return json({ current: updateApplied ? release.tag : release.current,
+    repository: release.repository, repository_url: release.repository_url, state: "configured" });
   if (path === "/api/v1/version/update") {
     assert.equal(q.get("startup"), "1");
     if (!startupChecked) ++startupChecks;
@@ -476,6 +523,38 @@ try {
     assert.equal(await isButtonDisabled(label), true);
   };
   const requestsFor = (method, path) => requests.filter((request) => request.method === method && request.path === path);
+  const checkTargetHeading = async (title, target, label) => {
+    const result = await evaluate(`(() => {
+      const heading = document.querySelector('.page-title');
+      const [h1, slash, picker] = heading.querySelector('.page-title-heading')?.children ?? [];
+      const name = picker?.querySelector('.target-context-name');
+      const arrow = picker?.querySelector('.dropdown-arrow');
+      const select = picker?.querySelector('select');
+      const time = heading.querySelector('.context-last-success');
+      if (!h1 || !slash || !name || !arrow || !select || !time) return null;
+      const rect = (node) => node.getBoundingClientRect();
+      const sameFont = (node) => ['fontFamily', 'fontSize', 'fontWeight', 'lineHeight']
+        .every((key) => getComputedStyle(node)[key] === getComputedStyle(h1)[key]);
+      return {
+        text: [h1.textContent, slash.textContent, name.textContent, select.selectedOptions[0].textContent],
+        accessible: !picker.querySelector('label') && select.getAttribute('aria-label') === ${JSON.stringify(label)},
+        style: sameFont(slash) && sameFont(name) && getComputedStyle(name).textDecorationLine === 'underline'
+          && getComputedStyle(picker).borderWidth === '0px',
+        arrow: rect(arrow).width > 0 && rect(arrow).left >= rect(name).right,
+        aligned: Math.abs(rect(h1).bottom - rect(slash).bottom) < 1
+          && Math.abs(rect(h1).bottom - rect(name).bottom) < 1
+          && Math.abs(rect(h1).bottom - rect(time).bottom) < 1 && rect(picker).right <= rect(time).left,
+        time: time.textContent,
+        fits: heading.scrollWidth <= heading.clientWidth + 1,
+      };
+    })()`);
+    assert.ok(result, `Title controls rendered for ${title}`);
+    assert.deepEqual(result.text, [title, "/", target, target]);
+    for (const key of ["accessible", "style", "arrow", "aligned", "fits"]) {
+      assert.equal(result[key], true, `${title}: ${key}`);
+    }
+    assert.match(result.time, /^最后采集：/);
+  };
 
   await call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
   await call("Page.navigate", { url });
@@ -553,6 +632,52 @@ try {
   assert.equal(await evaluate("document.querySelector('main.content h1').textContent"), "主机管理");
   assert.equal(await evaluate("window.smokeDocument"), true);
   assert.equal(documents, 1);
+
+  serviceScrollFixture = Array.from({ length: 115 }, (_, index) => {
+    const unit = `scroll-${String(index).padStart(3, "0")}.service`;
+    return { ...service, id: unit, unit, name: unit };
+  });
+  await nav("services");
+  await waitText("main.content", "scroll-049.service");
+  const loadedServiceRows = () => evaluate("document.querySelectorAll('main tbody tr').length");
+  const cursorsBefore = requestsFor("GET", "/api/v1/services").filter(({ query }) => query.cursor).length;
+  const servicePaginationRequests = () => requestsFor("GET", "/api/v1/services").filter(({ query }) => query.cursor).slice(cursorsBefore);
+  const scrollServices = () => evaluate(`(() => {
+    const inventory = document.querySelector('main .inventory');
+    inventory.scrollTop = inventory.scrollHeight;
+    for (let attempt = 0; attempt < 3; attempt++) inventory.dispatchEvent(new Event('scroll'));
+  })()`);
+  assert.equal(await loadedServiceRows(), 50);
+  assert.equal(await evaluate("[...document.querySelectorAll('main button')].some(button => ['首页', '下一页'].includes(button.textContent))"), false);
+  await scrollServices();
+  await waitText("main.content", "scroll-099.service");
+  assert.equal(await loadedServiceRows(), 100);
+  assert.deepEqual(servicePaginationRequests().map(({ query }) => query.cursor), ["50"]);
+  assert.ok(await evaluate("document.querySelector('main .inventory').scrollTop > 0"));
+  await scrollServices();
+  await retry(() => servicePaginationRequests().length === 2, "next service cursor requested");
+  await evaluate("document.querySelector('[data-sort=name]').click()");
+  await waitText("main.content", "scroll-114.service");
+  await retry(() => evaluate("document.querySelector('[data-sort=name]').parentElement.getAttribute('aria-sort') === 'descending'"), "sorted service list restarts from first batch");
+  assert.equal(await loadedServiceRows(), 50);
+  assert.equal(await evaluate("document.querySelector('main .inventory').scrollTop"), 0);
+  assert.equal(await evaluate("document.querySelector('main tbody tr:first-child').textContent.includes('scroll-114.service')"), true);
+  await scrollServices();
+  await waitText("main.content", "scroll-015.service");
+  await scrollServices();
+  await waitText("main.content", "scroll-000.service");
+  assert.equal(await loadedServiceRows(), 115);
+  await scrollServices();
+  await setField('input[name="q"]', "scroll-01");
+  await clickText("main .toolbar button", "筛选");
+  // The unfiltered list already contains this service while the new list loads.
+  await retry(() => evaluate(`(() => {
+    const rows = document.querySelectorAll('main tbody tr');
+    return rows.length === 10 && rows[0].textContent.includes('scroll-019.service');
+  })()`), "filtered list shows ten services in descending order");
+  assert.deepEqual(servicePaginationRequests().map(({ query }) => [query.cursor, query.direction]),
+    [["50", "asc"], ["100", "asc"], ["50", "desc"], ["100", "desc"]]);
+  serviceScrollFixture = null;
 
   const originalObservations = [host, cluster].map((entry) => entry.summary.service_observation);
   serviceCollectionProblem = true;
@@ -837,6 +962,7 @@ try {
   assert.equal(await evaluate("[...document.querySelectorAll('main tr a')].some(link => link.textContent === '查看')"), false);
   await evaluate("document.querySelector('main tr:first-child td:first-child').click()");
   await waitText("main.content", "集群详情");
+  await checkTargetHeading("集群详情", cluster.name, "选择集群");
   await clickText("main a", "主机管理");
   await waitText("main.content", "测试集群");
 
@@ -856,13 +982,7 @@ try {
   assert.equal(await evaluate("document.querySelector('main.content h1').textContent"), "主机管理");
   await evaluate("window.getSelection().removeAllRanges(); document.querySelector('.host-row td:nth-child(2)').click()");
   await waitText("main.content", "50.0%");
-  assert.equal(await evaluate("document.querySelector('main.content h1').textContent"), "主机详情");
-  assert.deepEqual(await evaluate(`(() => {
-    const title = document.querySelector('.page-title');
-    return [...title.children].map(node => node.matches('h1') ? node.textContent
-      : node.classList.contains('target-context-control') ? 'target' : node.classList.contains('context-last-success') ? 'last-success' : 'other');
-  })()`), ["主机详情", "target", "last-success"]);
-  assert.equal(await evaluate("document.querySelector('.context-last-success').textContent.startsWith('最后采集：')"), true);
+  await checkTargetHeading("主机详情", host.name, "选择主机");
   assert.deepEqual(await evaluate("[...document.querySelectorAll('[aria-label=CPU趋势] polyline')].map(line => line.getAttribute('points').split(' ').length)"), [2, 2]);
   const metricsTables = await evaluate(`[...document.querySelectorAll('main .metric-inventories table')].map(table => ({
     headers: [...table.querySelectorAll('th')].map(cell => cell.textContent),
@@ -880,16 +1000,27 @@ try {
   await checkViewportLists(evaluate, ["磁盘", "网卡"]);
   await call("Emulation.setDeviceMetricsOverride", { width: 365, height: 640, deviceScaleFactor: 1, mobile: true });
   assert.deepEqual(await detailLayout(), { beside: false, stacked: true });
+  await checkTargetHeading("主机详情", host.name, "选择主机");
   await checkViewportLists(evaluate, ["磁盘", "网卡"]);
   await call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
   await clickText("main a", "网络详情");
   await waitText("main.content", "fixture-if");
-  assert.deepEqual(await evaluate(`[...document.querySelector('.page-title').children].map(node => node.matches('h1') ? node.textContent
-    : node.classList.contains('target-context-control') ? 'target' : node.classList.contains('context-last-success') ? 'last-success' : 'other')`),
-  ["网络", "target", "last-success"]);
+  await checkTargetHeading("网络", host.name, "选择主机");
   await clickText("main .tabs a", "端口");
   await waitText("main.content", "8080");
+  const otherHost = targets.find(({ name }) => name === "新测试主机");
+  const headingPicker = ".page-title select[name=id]";
+  const documentsBeforeSwitch = documents;
+  await setField(headingPicker, otherHost.id, "change");
+  await retry(() => requestsFor("GET", `/api/v1/hosts/${otherHost.id}/network/listeners`).length > 0, "switched host on the port tab");
+  await retry(() => evaluate("document.querySelector('.target-context-name')?.textContent === '新测试主机'"), "switched host name");
+  await checkTargetHeading("网络", otherHost.name, "选择主机");
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('tab')"), "listeners");
+  assert.equal(documents, documentsBeforeSwitch);
+  await setField(headingPicker, host.id, "change");
+  await retry(() => evaluate("document.querySelector('.target-context-name')?.textContent === '测试主机'"), "returned to the original host");
   await waitText("main.content", "不可读（端口已采集）");
+  await waitText("main.content", "可查看下方的主机授权状态");
   assert.equal(await evaluate("document.querySelector('main tbody tr')?.cells[2]?.textContent"), "8080");
   await checkViewportLists(evaluate, ["端口"]);
   assert.deepEqual(await evaluate("[...document.querySelectorAll('main th')].map(node => node.textContent)"),
@@ -907,7 +1038,7 @@ try {
     ["iptables-legacy · IPV6", "—", "—", "not_installed", "未检测到工具"],
   ]);
 
-  await waitText("main.content", "防火墙授权：已安装 · v0.1.0 aaaaa · 可用版本 v0.1.0 bbbbb");
+  await waitText("main.content", "主机授权：已安装 · v0.1.0 aaaaa · 可用版本 v0.1.0 bbbbb");
   assert.equal(await evaluate("document.querySelector('main').textContent.includes('查看授权设置')"), false);
 
   await nav("services");
@@ -958,6 +1089,10 @@ try {
   assert.equal(await evaluate("document.querySelector('#version-popover a').href"), release.release_url);
   await waitText("#version-popover", release.release_notes);
   assert.equal(await evaluate("Boolean(document.querySelector('#version-popover em'))"), false);
+  assert.equal(await evaluate("document.querySelector('#version-popover > a').href"), release.repository_url);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('#version-popover a')].map(link => link.target)"),
+    ["_blank", "_blank"]);
+  assert.equal(await evaluate("document.querySelector('#version-popover').textContent.includes('null')"), false);
   await evaluate("document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape' }))");
   assert.equal(await evaluate("document.querySelector('#version-popover').hidden"), true);
   assert.equal(startupChecks, 1);
@@ -972,9 +1107,10 @@ try {
   assert.equal(await evaluate("document.querySelectorAll('[data-nav]').length"), 5);
   assert.equal(await evaluate("[...document.querySelectorAll('[data-nav]')].some(item => item.textContent.includes('授权管理'))"), false);
   await hostAction("安装授权");
-  await clickText("#dialog button", "安装授权");
   await waitText("#dialog", "自动安装授权需要管理员权限");
-  assert.deepEqual(requestsFor("POST", `/api/v1/hosts/${host.id}/firewall-maintenance`).at(-1).body, { action: "install" });
+  assert.equal(await evaluate("Boolean(document.querySelector('#dialog input[name=service_unit]'))"), false);
+  assert.deepEqual(requestsFor("POST", `/api/v1/hosts/${host.id}/firewall-maintenance`).at(-1).body,
+    { action: "install" });
   await clickText("#dialog button", "上传脚本");
   await waitText("#dialog ol li:nth-child(2)", "安装命令");
   assert.deepEqual(requestsFor("POST", `/api/v1/targets/${host.id}/maintenance/upload`).at(-1).body,
@@ -982,15 +1118,104 @@ try {
   await clickText("#dialog button", "重新检测授权");
   await clickText("#dialog button", "重新检测授权");
   await waitText("#dialog", "v1.1.0 bbbbb");
+  await clickText("#dialog button", "关闭");
+  assert.deepEqual(await hostMenu(), ["卸载授权", "创建告警", "解绑"]);
+  host.host_authorization_update_available = true;
+  delete host.host_authorization_up_to_date;
+  firewallVersion = oldFirewallVersion;
+  helperNeedsMigration = true;
+  await nav("services");
+  await waitText("main.content", "fixture.service");
+  await nav("targets");
+  assert.deepEqual(await hostMenu(), ["更新授权", "卸载授权", "创建告警", "解绑"]);
+  await nav("network");
+  await clickText("main .tabs a", "防火墙");
+  await waitText("main.content", "可用版本 v0.1.0 bbbbb");
+  const updateButtonExists = () => evaluate("[...document.querySelectorAll('main button')].some(button => button.textContent.trim() === '更新授权')");
+  const documentsBeforeAuthorizationUpdate = documents;
+  await clickText("main button", "更新授权");
+  await waitText("#dialog-title", "更新授权");
+  const assertMigrationVersions = async () => {
+    const fields = await evaluate(`Object.fromEntries([...document.querySelectorAll('#dialog dt')]
+      .map(label => [label.textContent, label.nextElementSibling.textContent]))`);
+    assert.equal(fields["已安装版本"], "v0.1.0 aaaaa");
+    assert.equal(fields["更新版本"], "v1.1.0 bbbbb");
+    assert.equal(fields["SHA-256"], undefined);
+  };
+  await waitText("#dialog", "管理员授权一次");
+  await assertMigrationVersions();
+  assert.equal(await evaluate("document.querySelector('#dialog').innerText.includes('失败')"), false);
+  await waitText("main.content", "可用版本 v0.1.0 bbbbb");
+  assert.equal(await updateButtonExists(), true);
+  const uploadPath = `/api/v1/targets/${host.id}/maintenance/upload`;
+  const maintenancePath = `/api/v1/hosts/${host.id}/firewall-maintenance`;
+  assert.deepEqual(requestsFor("POST", maintenancePath).at(-1).body, { action: "update" });
+  assert.equal(await evaluate("document.querySelector('#dialog button.primary').textContent"), "使用管理员凭据迁移");
+  assert.equal(await evaluate("Boolean(document.querySelector('#dialog .command'))"), false);
+  await clickText("#dialog button", "上传迁移脚本");
+  await waitText("#dialog ol li:nth-child(2)", "迁移命令");
+  await assertMigrationVersions();
+  assert.equal(await evaluate("document.querySelector('#dialog').innerText.includes('c'.repeat(64))"), false);
+  assert.equal(await evaluate("document.querySelector('#dialog .command').textContent.includes('c'.repeat(64))"), true);
+  assert.deepEqual(requestsFor("POST", uploadPath).at(-1).body, { action: "update", auto_job_id: "firewall-migration-fixture" });
+  await clickText("#dialog button", "重新检测授权");
+  await clickText("#dialog button", "重新检测授权");
+  await waitText("#dialog", "v1.1.0 bbbbb");
+  await clickText("#dialog button", "关闭");
+  host.host_authorization_update_available = true;
+  delete host.host_authorization_up_to_date;
+  firewallVersion = oldFirewallVersion;
+  await nav("targets");
+  await nav("network");
+  await clickText("main .tabs a", "防火墙");
+  await waitText("main.content", "可用版本 v0.1.0 bbbbb");
+  const uploadsBeforeUpdate = requestsFor("POST", uploadPath).length;
+  await clickText("main button", "更新授权");
+  await waitText("#dialog", "执行中");
+  assert.deepEqual(requestsFor("POST", maintenancePath).at(-1).body, { action: "update" });
+  assert.equal(requestsFor("POST", uploadPath).length, uploadsBeforeUpdate);
+  assert.equal(await evaluate("Boolean(document.querySelector('#dialog .command'))"), false);
+  assert.equal(await evaluate("document.querySelector('#dialog').textContent.includes('管理员')"), false);
+  await clickText("#dialog button", "关闭");
+  helperUpdateCompleted = true;
+  await waitText("main.content", "已是最新版本");
+  assert.equal(await updateButtonExists(), false);
+  await clickText("main .tabs a", "端口");
+  await waitText("main.content", "8080");
+  await waitText("main.content", "已是最新版本");
+  assert.equal(await updateButtonExists(), false);
+  await nav("targets");
+  await waitText(".host-row", "已是最新版本");
+  assert.equal(documents, documentsBeforeAuthorizationUpdate);
   assert.deepEqual(await hostMenu(), ["卸载授权", "创建告警", "解绑"]);
   await hostAction("卸载授权");
-  await clickText("#dialog button", "卸载授权");
-  await waitText("#dialog", "自动卸载授权需要管理员权限");
+  await waitText("#dialog", "未安装");
+  assert.deepEqual(requestsFor("POST", maintenancePath).at(-1).body, { action: "uninstall" });
+  assert.equal(requestsFor("POST", uploadPath).length, uploadsBeforeUpdate);
+  assert.equal(await evaluate("document.querySelector('#dialog').textContent.includes('管理员')"), false);
+  await clickText("#dialog button", "关闭");
+  await waitText(".host-row .host-action-menu", "安装授权");
+  assert.deepEqual(await hostMenu(), ["安装授权", "创建告警", "解绑"]);
+
+  host.firewall_authorization_status = "installed";
+  host.host_authorization_update_available = true;
+  firewallVersion = oldFirewallVersion;
+  firewallUninstalled = false;
+  await nav("network");
+  await nav("targets");
+  await waitText(".host-row .host-action-menu", "更新授权");
+  await hostAction("卸载授权");
+  await waitText("#dialog", "当前授权需要由目标主机管理员卸载");
+  await waitText("#dialog", "是否上传维护脚本");
+  assert.equal(requestsFor("POST", uploadPath).length, uploadsBeforeUpdate);
   await clickText("#dialog button", "使用管理员凭据");
   await setField('#dialog input[name="admin_user"]', "fixture-admin");
   await setField('#dialog input[name="admin_key_file"]', "/<FIXTURE_ADMIN_KEY>");
   await clickText("#dialog button", "卸载授权");
   await waitText("#dialog", "未安装");
+  assert.deepEqual(requestsFor("POST", maintenancePath).at(-1).body, {
+    action: "uninstall", credential_ref: { ssh: { user: "fixture-admin", key_file: "/<FIXTURE_ADMIN_KEY>" } },
+  });
 
   host.firewall_authorization_status = "native";
   await nav("services");
@@ -1022,6 +1247,7 @@ try {
   await assertUnconfirmed("确认解绑");
   await clickConfirmation();
   await clickText("#dialog button", "确认解绑");
+  await waitText("#dialog", "当前授权需要由目标主机管理员卸载");
   await waitText("#dialog", "是否上传维护脚本");
   assert.equal(targets.includes(host), true);
   assert.deepEqual(uploads(), []);
@@ -1055,6 +1281,10 @@ try {
   await waitText("#version-number", release.tag);
   await retry(() => startupChecks === 2, "one check after application restart");
   assert.equal(await evaluate("document.querySelector('#update-dot').hidden"), true);
+  await evaluate("document.querySelector('#version-trigger').click()");
+  await waitText("#version-popover", "当前版本已是最新正式版本");
+  assert.equal(await evaluate("document.querySelector('#version-popover > a').href"), release.repository_url);
+  assert.equal(await evaluate("document.querySelector('#version-popover').textContent.includes('null')"), false);
   assert.deepEqual(requestsFor("POST", "/api/v1/version/update/apply").map(({ body }) => body),
     [{ tag: release.tag, sha256: release.sha256 }]);
 

@@ -21,6 +21,7 @@ pkg-config --print-errors --exists gtk+-3.0 'webkit2gtk-4.1 >= 2.40'
 go_bin=$(command -v "${GO_BIN:-go}")
 case "$go_bin" in /*) ;; *) go_bin="$(pwd)/$go_bin" ;; esac
 src=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)
+repo=$(sh "$src/packaging/release/repository.sh" "$src")
 out_parent=${2:-"$src/dist/desktop"}
 mkdir -p -- "$out_parent/$tag"
 out_parent=$(CDPATH='' cd -- "$out_parent/$tag" && pwd -P)
@@ -34,23 +35,22 @@ trap 'rm -rf -- "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 stage="$work/package"
 mkdir -p "$work/src" "$work/assets" "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" \
-  "$stage/usr/share/doc/imon-desktop"
+  "$stage/usr/share/doc/imon-desktop" "$stage/usr/share/icons/hicolor/scalable/apps" \
+  "$stage/usr/share/icons/hicolor/64x64/apps"
 cp "$src/go.mod" "$src/go.sum" "$work/src/"
 cp -R "$src/cmd" "$src/internal" "$src/web" "$work/src/"
 
+sh "$src/packaging/release/build-helpers.sh" "$tag" "$go_bin" "$work/src"
 cd "$work/src"
 export GOFLAGS='' GOWORK=off GOAMD64=v1 GOARM64=v8.0
-for target in amd64 arm64; do
-  printf 'Building Linux firewall reader (%s)\n' "$target"
-  CGO_ENABLED=0 GOOS=linux GOARCH="$target" "$go_bin" build -buildvcs=false -trimpath -ldflags='-s -w' \
-    -o "internal/firewall/bundles/firewall-read-$target" ./cmd/imon-firewall
-done
-IMON_REQUIRE_BUNDLES=1 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$go_bin" test -count=1 ./internal/firewall
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 "$go_bin" build -tags desktop -buildvcs=false -trimpath \
-  -ldflags="-s -w -X main.version=$tag" -o "$stage/usr/bin/imon-desktop" ./cmd/imon-desktop
+  -ldflags="-s -w -X main.version=$tag -X main.defaultReleaseRepo=$repo" \
+  -o "$stage/usr/bin/imon-desktop" ./cmd/imon-desktop
 [ "$("$stage/usr/bin/imon-desktop" --version)" = "$tag" ]
 
 cp "$src/packaging/desktop/imon.desktop" "$stage/usr/share/applications/"
+cp "$src/packaging/desktop/imon.svg" "$stage/usr/share/icons/hicolor/scalable/apps/"
+cp "$src/packaging/desktop/imon-64.png" "$stage/usr/share/icons/hicolor/64x64/apps/imon.png"
 cp "$src/internal/desktop/vendor/LICENSE" "$stage/usr/share/doc/imon-desktop/webview-copyright"
 cp "$src/docs/guides/backup-and-restore.md" "$stage/usr/share/doc/imon-desktop/"
 installed_size=$(du -sk "$stage" | cut -f1)

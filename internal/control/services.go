@@ -18,7 +18,7 @@ import (
 )
 
 const servicesSQL = `SELECT t.target_id,t.kind,t.name,t.connection_rev,r.object_key,r.payload,p.observed_at,(a.status IS NULL OR a.status<>'ok'),a.error_code,
- coalesce(ga.object_ids,'[]'),dr.replicas
+ ga.object_ids,dr.replicas
  FROM targets t JOIN group_state g ON (g.target_id,g.connection_rev)=(t.target_id,t.connection_rev)
  JOIN snapshot_rows r ON (r.target_id,r.connection_rev,r.group_name,r.batch_id)=(g.target_id,g.connection_rev,g.group_name,g.published_batch_id)
  JOIN snapshot_batches p ON (p.target_id,p.connection_rev,p.group_name,p.batch_id)=(g.target_id,g.connection_rev,g.group_name,g.published_batch_id)
@@ -43,6 +43,7 @@ type service struct {
 	ObservedAt     int64    `json:"observed_at"`
 	Stale          bool     `json:"stale"`
 	Authorized     bool     `json:"authorized"`
+	UsesHostLogin  bool     `json:"uses_host_login,omitempty"`
 	ResumeReplicas *int32   `json:"resume_replicas,omitempty"`
 	CPUPercent     *float64 `json:"cpu_percent,omitempty"`
 	MemoryBytes    *uint64  `json:"memory_bytes,omitempty"`
@@ -54,7 +55,8 @@ type rowScanner interface{ Scan(...any) error }
 
 func readService(row rowScanner, s Settings) (service, error) {
 	var v service
-	var data, ids string
+	var data string
+	var ids sql.NullString
 	if err := row.Scan(&v.TargetID, &v.Source, &v.TargetName, &v.ConnectionRev, &v.ObjectKey, &data, &v.ObservedAt, &v.Stale, &v.Error, &ids, &v.ResumeReplicas); err != nil {
 		return v, err
 	}
@@ -76,11 +78,18 @@ func readService(row rowScanner, s Settings) (service, error) {
 		v.UID = v.ObjectKey
 	}
 	v.ID = v.TargetID + "." + base64.RawURLEncoding.EncodeToString([]byte(v.ObjectKey))
-	var allowed []string
-	if err := json.Unmarshal([]byte(ids), &allowed); err != nil {
-		return v, err
+	if ids.Valid {
+		var allowed []string
+		if err := json.Unmarshal([]byte(ids.String), &allowed); err != nil {
+			return v, err
+		}
+		v.Authorized = slices.Contains(allowed, v.ID)
 	}
-	v.Authorized = slices.Contains(allowed, v.ID)
+	if !v.Authorized && v.Source == "host" && collector.ValidSystemdServiceUnit(v.Unit) {
+		// Units without a separate credential use the bound SSH account and
+		// its native privileges or the installed host helper.
+		v.Authorized, v.UsesHostLogin = true, true
+	}
 	v.Stale = v.Stale || s.Enabled && time.Since(time.UnixMilli(v.ObservedAt)) > 2*s.period(v.Source, "systemd")
 	return v, nil
 }
@@ -362,14 +371,18 @@ func (c *Control) serviceAction(w http.ResponseWriter, r *http.Request) {
 		if err := readBinding(ctx, tx, v.TargetID, &b); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT credential_ref FROM service_authorizations WHERE target_id=? AND connection_rev=?`, b.ID, b.ConnectionRev).Scan(&ref); err != nil {
-			return err
-		}
-		if err := json.Unmarshal([]byte(ref), &cfg); err != nil {
-			return err
-		}
-		if !separateCredentials(b, &cfg) {
-			return errForbidden
+		if v.UsesHostLogin {
+			cfg = b.Config
+		} else {
+			if err := tx.QueryRowContext(ctx, `SELECT credential_ref FROM service_authorizations WHERE target_id=? AND connection_rev=?`, b.ID, b.ConnectionRev).Scan(&ref); err != nil {
+				return err
+			}
+			if err := json.Unmarshal([]byte(ref), &cfg); err != nil {
+				return err
+			}
+			if !separateCredentials(b, &cfg) {
+				return errForbidden
+			}
 		}
 		if in.ConfirmUnknown {
 			if _, err := tx.ExecContext(ctx, `UPDATE collection_jobs SET status='failed',error_code='operator_acknowledged' WHERE target_id=? AND status='unknown'`, v.TargetID); err != nil {
@@ -416,14 +429,20 @@ func (c *Control) runAction(job Job, b binding, cfg collector.Config, ref string
 				return store.ErrStaleTarget
 			}
 			var currentRef, raw string
-			if err := tx.QueryRowContext(ctx, `SELECT credential_ref,object_ids FROM service_authorizations WHERE target_id=? AND connection_rev=?`, b.ID, b.ConnectionRev).Scan(&currentRef, &raw); err != nil {
+			err := tx.QueryRowContext(ctx, `SELECT credential_ref,object_ids FROM service_authorizations WHERE target_id=? AND connection_rev=?`, b.ID, b.ConnectionRev).Scan(&currentRef, &raw)
+			if err == nil {
+				var ids []string
+				if json.Unmarshal([]byte(raw), &ids) != nil {
+					return errForbidden
+				}
+				listed := slices.Contains(ids, v.ID)
+				if v.UsesHostLogin && listed || !v.UsesHostLogin && (!listed || currentRef != ref) {
+					return errForbidden
+				}
+			} else if !v.UsesHostLogin || !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			var ids []string
-			if json.Unmarshal([]byte(raw), &ids) != nil || currentRef != ref || !slices.Contains(ids, v.ID) {
-				return errForbidden
-			}
-			_, err := tx.ExecContext(ctx, `UPDATE service_action_details SET attempted=1 WHERE job_id=?`, job.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE service_action_details SET attempted=1 WHERE job_id=?`, job.ID)
 			return err
 		})
 	})

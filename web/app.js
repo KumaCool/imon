@@ -35,6 +35,7 @@ const get = (path, options) => api(path, "GET", undefined, options);
 const targetPath = (id) => `/targets/${key(id)}`;
 const key = (value) => encodeURIComponent(String(value));
 let generation = 0;
+let routeRead;
 let readRequest = 0;
 let toastTimer;
 let localVersion;
@@ -95,6 +96,7 @@ async function api(path, method, body, options = {}) {
   if (!response.ok) {
     if (response.status === 401 && path !== "/session" && !options.keepSession && !options.signal?.aborted && !updateRunning) {
       generation += 1;
+      routeRead?.abort();
       clearCollections();
       if (dialog.open) dialog.close();
       closeVersion();
@@ -296,9 +298,14 @@ function listTable(label, columns, rows, empty = "暂无数据") {
     element("table", { "aria-label": label }, element("thead", {}, head), element("tbody", {}, entries)));
 }
 
-function heading(title, actions = [], collecting = false, context = []) {
+function heading(title, actions = [], collecting = false, context = null) {
+  const name = element("h1", {}, title);
+  const titleLine = context
+    ? element("div", { class: "page-title-heading" }, name,
+      element("span", { class: "page-title-separator", "aria-hidden": "true" }, "/"), context.picker.control)
+    : name;
   return element("header", { class: "page-head" },
-    element("div", { class: "page-title" }, element("h1", {}, title), ...context),
+    element("div", { class: context ? "page-title page-title-with-target" : "page-title" }, titleLine, context?.lastSuccess),
     element("div", { class: "page-tools" },
       collecting ? element("div", { class: "collection-status", hidden: true }) : null,
       actions.length ? element("div", { class: "actions" }, actions) : null));
@@ -447,6 +454,9 @@ function navigate(href, replace = false) {
 
 async function render({ quiet = false } = {}) {
   const id = ++generation;
+  routeRead?.abort();
+  routeRead = new AbortController();
+  const { signal } = routeRead;
   const query = routeQuery();
   const requested = query.get("view");
   const legacyServiceFilter = !requested && ["source", "target", "state", "namespace", "q"].some((field) => query.has(field));
@@ -465,7 +475,7 @@ async function render({ quiet = false } = {}) {
     routeProgress.hidden = false;
   }
   try {
-    await route.show(query, id);
+    await route.show(query, id, signal);
   } catch (error) {
     if (id === generation && !quiet) insert(id, heading(route.title), notice(error.message, true), button("重新加载", render));
   } finally {
@@ -557,12 +567,13 @@ function snapshotItems(page) {
   return items(page).map((row) => row.payload ? { ...row.payload, object_key: row.object_key } : row);
 }
 
-async function allPages(path, values = {}) {
+async function allPages(path, values = {}, options = {}) {
   const result = [];
   const cursors = new Set();
   let cursor;
   do {
-    const page = await get(path + params({ ...values, cursor, limit: 200 }));
+    if (options.signal?.aborted) break;
+    const page = await get(path + params({ ...values, cursor, limit: 200 }), options);
     result.push(...items(page));
     cursor = page?.next_cursor;
     if (cursor) {
@@ -582,44 +593,72 @@ function showTask(jobID, options = {}) {
     element("div", { class: "form-actions" }, button("关闭", closeDialog)));
   const startedIn = generation;
   showDialog(options.title || "任务进度", taskView);
+  const taskVisible = () => taskView.isConnected && dialog.open;
   const refresh = async () => {
-    if (!taskView.isConnected || !dialog.open) return;
+    if (!taskVisible() && !options.refreshAfterSuccess) return;
     try {
       const job = await get(`/jobs/${key(jobID)}`);
-      if (!taskView.isConnected || !dialog.open) return;
       const state = job.status === "running" ? "running_job" : job.status;
       const results = job.results || {};
       const waiting = state === "success" && results.convergence === "pending";
-      const taskError = job.error_code === "ssh_network_unreachable" ? sshTestErrors.ssh_network_unreachable
+      const pending = ["queued", "running"].includes(job.status) || waiting;
+      const delay = waiting ? 5000 : 700;
+      if (!pending && state === "success") options.refreshAfterSuccess?.();
+      if (!taskVisible()) {
+        if (pending && options.refreshAfterSuccess) setTimeout(refresh, delay);
+        return;
+      }
+      const migrating = options.updating && job.error_code === "helper_migration_required";
+      const taskError = migrating ? "" : job.error_code === "ssh_network_unreachable" ? sshTestErrors.ssh_network_unreachable
         : sourceErrorLabel(job.error_code);
-      feedback.replaceChildren(chip(state, state === "success" && results.convergence ? "副本数已写入" : undefined),
+      feedback.replaceChildren(chip(migrating ? "awaiting_admin" : state, state === "success" && results.convergence ? "副本数已写入" : undefined),
         taskError || "");
-      const details = Object.entries(results).filter(([group]) => !["upload_only", "unbind_requested"].includes(group)).map(([group, value]) => {
-        if (group === "convergence") return ["达标状态", convergenceText[value] || display(value)];
-        if (group === "observed_state") return ["实际服务状态", statusText[value] || display(value)];
-        if (group === "convergence_error") return ["达标检查结果", sourceErrorLabel(value)];
-        if (group === "firewall_status") return ["授权状态", firewallStatusText[value] || display(value)];
-        if (group === "installed_version") return ["已安装版本", `${localVersion?.current ? `${localVersion.current} ` : ""}${value.slice(0, 5)}`];
-        if (group === "requested_version") return ["目标版本", `${localVersion?.current ? `${localVersion.current} ` : ""}${value.slice(0, 5)}`];
-        if (group === "unbound") return ["绑定状态", "已解绑"];
-        if (group === "cleanup_confirmed") return ["已确认清理", value === "true" || value === true ? "是" : "否"];
-        return [
-          groupLabel(group), value && typeof value === "object" ? display(value.status || value.error_code || value) : value || "成功",
-        ];
-      });
+      const details = [];
+      if (results.installed_version) {
+        const displayVersion = results.installed_display_version ||
+          `${!options.updating && localVersion?.current ? `${localVersion.current} ` : ""}${results.installed_version.slice(0, 5)}`;
+        details.push(["已安装版本", displayVersion]);
+      }
+      if (results.requested_version) {
+        const displayVersion = results.requested_display_version ||
+          `${localVersion?.current ? `${localVersion.current} ` : ""}${results.requested_version.slice(0, 5)}`;
+        details.push([options.updating ? "更新版本" : "目标版本", displayVersion]);
+      }
+      for (const [group, value] of Object.entries(results)) {
+        if (["upload_only", "unbind_requested", "selected_service_units", "requested_units_sha256", "installed_version",
+          "installed_display_version", "requested_version", "requested_display_version"].includes(group)) continue;
+        let entry;
+        if (group === "convergence") entry = ["达标状态", convergenceText[value] || display(value)];
+        else if (group === "observed_state") entry = ["实际服务状态", statusText[value] || display(value)];
+        else if (group === "convergence_error") entry = ["达标检查结果", sourceErrorLabel(value)];
+        else if (group === "firewall_status") entry = ["授权状态", firewallStatusText[value] || display(value)];
+        else if (group === "unbound") entry = ["绑定状态", "已解绑"];
+        else if (group === "cleanup_confirmed") entry = ["已确认清理", value === "true" || value === true ? "是" : "否"];
+        else entry = [groupLabel(group), value && typeof value === "object" ? display(value.status || value.error_code || value) : value || "成功"];
+        details.push(entry);
+      }
       if (job.stage_path) details.push(["远端脚本", job.stage_path]);
-      if (job.sha256) details.push(["SHA-256", job.sha256]);
       result.replaceChildren(...(details.length ? [pairs(details)] : []));
       if (job.error_code === "administrator_required" && options.administrator) {
+        if (options.operation === "uninstall") {
+          result.append(notice("当前授权需要由目标主机管理员卸载。可使用管理员 SSH 凭据继续。"));
+        }
         result.append(button("使用管理员凭据", options.administrator));
       }
+      if (migrating && options.administrator) {
+        result.append(notice("已安装的辅助程序还不支持自行更新。请由管理员授权一次，后续版本会由辅助程序自行安装。"),
+          button("使用管理员凭据迁移", options.administrator, "primary"));
+      }
+      if (options.configureHostAccess && ["permission_denied", "service_not_granted", "service_helper_upgrade_required"].includes(job.error_code)) {
+        result.append(button("配置主机授权", () => options.configureHostAccess(job.error_code)));
+      }
       if (job.manual_upload_available && options.upload) {
-        const operation = options.operation === "install" ? "安装"
-          : options.operation === "uninstall" ? "卸载" : "清理";
-        result.append(notice(options.operation
-          ? `自动${operation}授权需要管理员权限。是否上传维护脚本，由你在目标主机上执行？`
-          : "自动清理需要管理员权限。是否上传维护脚本，由你在目标主机上执行？"),
-          button("上传脚本", async (event) => {
+        if (!options.updating) {
+          result.append(notice(options.operation === "uninstall"
+            ? "是否上传维护脚本，由你在目标主机上以管理员身份执行？"
+            : "自动安装授权需要管理员权限。是否上传维护脚本，由你在目标主机上执行？"));
+        }
+        result.append(button(options.updating ? "上传迁移脚本" : "上传脚本", async (event) => {
             const upload = event.currentTarget;
             upload.disabled = true;
             try {
@@ -629,7 +668,7 @@ function showTask(jobID, options = {}) {
               if (taskView.isConnected && dialog.open) formError(feedback, error);
               upload.disabled = false;
             }
-          }, "primary"));
+          }, options.updating ? "secondary" : "primary"));
       }
       if (!job.manual_upload_available && job.download_path === `/api/v1/jobs/${key(jobID)}/firewall-script`) {
         result.append(desktop ? button("保存维护脚本", async (event) => {
@@ -646,17 +685,19 @@ function showTask(jobID, options = {}) {
         }) : element("a", { href: job.download_path, class: "action secondary", download: "firewall-maintain.sh" }, "下载维护脚本"));
       }
       if (job.command) {
-        const operation = options.operation === "install" ? "安装"
+        const operation = options.updating ? "迁移" : options.operation === "install" ? "安装"
           : options.operation === "uninstall" ? "卸载" : "清理";
         const command = element("pre", { class: "command" }, job.command);
+        const fullCommand = element("details", {}, element("summary", {}, "查看完整命令"), command);
         const steps = element("ol", {},
           element("li", {}, "以 root 或具有 sudo 权限的账户登录目标主机，先单独运行 ", element("code", {}, "/bin/sh"), " 并按回车。"),
-          element("li", {}, `进入 /bin/sh 后，执行下方${operation}命令。完成后点击「重新检测授权」。`));
+          element("li", {}, `进入 /bin/sh 后，复制并执行${operation}命令。完成后点击「重新检测授权」。`));
         result.append(steps,
-          command, button("复制命令", async () => {
+          button("复制命令", async () => {
           try {
             await navigator.clipboard.writeText(job.command);
           } catch {
+            fullCommand.open = true;
             const selection = window.getSelection();
             const range = document.createRange();
             range.selectNodeContents(command);
@@ -668,12 +709,12 @@ function showTask(jobID, options = {}) {
             }
           }
           notify("已复制命令。");
-        }));
+        }), fullCommand);
       }
-      if (options.verify && (job.command || state === "unknown" || (options.retryVerify && state === "failed"))) {
+      if (options.verify && (job.command || state === "unknown" || (options.retryVerify && state === "failed" && !migrating))) {
         result.append(button("重新检测授权", options.verify));
       }
-      if (["queued", "running"].includes(job.status) || waiting) setTimeout(refresh, waiting ? 5000 : 700);
+      if (pending) setTimeout(refresh, delay);
       else {
         if (options.complete && state === "success") await options.complete(job, result);
         if (taskView.isConnected && generation === startedIn) render();
@@ -970,9 +1011,96 @@ function serviceResourceHint(service, metric) {
 }
 
 const serviceColumns = { name: "服务", target: "目标", state: "状态", cpu: "CPU", memory: "内存" };
+const servicePageSize = 50;
 
-async function showServices(query, id) {
-  const targets = await allPages("/targets");
+function scrollServiceList(values, columns, renderRow, empty, signal) {
+  const inventory = listTable("服务列表", columns, [], empty);
+  const body = inventory.querySelector("tbody");
+  const emptyRow = body.firstElementChild;
+  body.replaceChildren();
+  const feedback = element("div", { class: "service-list-feedback", role: "status" });
+  inventory.append(feedback);
+  const region = element("div", { class: "list-page" }, inventory);
+  const shown = new Set();
+  let nextCursor;
+  let loaded = false;
+  let failed = false;
+  let pending;
+  let queuedRefresh;
+
+  function nearEnd() {
+    if (!signal.aborted && region.isConnected && nextCursor && !pending && !failed &&
+        inventory.scrollHeight - inventory.scrollTop - inventory.clientHeight <= 160) load(nextCursor);
+  }
+
+  async function read(cursor, quiet) {
+    const limit = quiet ? Math.max(servicePageSize, shown.size) : servicePageSize;
+    if (!quiet || !loaded) feedback.textContent = "正在加载…";
+    const rows = [];
+    let next = cursor;
+    try {
+      // Refresh all loaded rows together. Reuse larger API batches when the user has scrolled deep.
+      do {
+        const page = await get("/services" + params({ ...values, cursor: next, limit: Math.min(200, limit - rows.length) }), { signal });
+        if (signal.aborted) return;
+        const batch = items(page);
+        rows.push(...batch);
+        next = batch.length && page?.next_cursor !== next ? page?.next_cursor : null;
+      } while (quiet && next && rows.length < limit);
+
+      const scroll = { left: inventory.scrollLeft, top: inventory.scrollTop };
+      const restoreFocus = !cursor && loaded && body.contains(document.activeElement);
+      if (!cursor) shown.clear();
+      const fragment = document.createDocumentFragment();
+      for (const service of rows) {
+        if (shown.has(service.id)) continue;
+        shown.add(service.id);
+        fragment.append(tableRow(renderRow(service)));
+      }
+      if (cursor) body.append(fragment);
+      else body.replaceChildren(shown.size ? fragment : emptyRow);
+      nextCursor = next;
+      loaded = true;
+      failed = false;
+      feedback.replaceChildren();
+      if (!cursor) {
+        inventory.scrollTo(scroll);
+        if (restoreFocus) inventory.focus({ preventScroll: true });
+      }
+    } catch (error) {
+      if (signal.aborted || (quiet && loaded)) return;
+      failed = true;
+      feedback.replaceChildren(notice(error.message, true), button("重新加载", () => load(cursor, quiet)));
+    }
+  }
+
+  function load(cursor, quiet = false) {
+    if (signal.aborted) return Promise.resolve();
+    pending ||= read(cursor, quiet).finally(() => {
+      pending = null;
+      if (!signal.aborted) requestAnimationFrame(nearEnd);
+    });
+    return pending;
+  }
+
+  const resize = new ResizeObserver(nearEnd);
+  resize.observe(inventory);
+  signal.addEventListener("abort", () => resize.disconnect(), { once: true });
+  inventory.addEventListener("scroll", nearEnd, { passive: true, signal });
+  region.snapshotReady = load(null);
+  region.refreshSnapshot = () => {
+    if (!pending) return load(null, true);
+    queuedRefresh ||= pending.then(() => {
+      queuedRefresh = null;
+      return load(null, true);
+    });
+    return queuedRefresh;
+  };
+  return region;
+}
+
+async function showServices(query, id, signal) {
+  const targets = await allPages("/targets", {}, { signal });
   if (id !== generation) return;
   const source = ["host", "cluster"].includes(query.get("source")) ? query.get("source") : "";
   const requestedSort = query.get("sort");
@@ -1022,26 +1150,36 @@ async function showServices(query, id) {
     if (lastObservations.some((row) => row.error_code)) return ["当前没有可显示的服务数据"];
     return observed.length && observed.length === lastObservations.length ? ["采集成功，未发现数据"] : ["暂无已采集数据"];
   }
-  const listing = pageList("/services", {
+  const columns = Object.entries(serviceColumns).map(([field, label]) => {
+    const active = field === sort;
+    const next = active ? direction === "asc" ? "desc" : "asc" : ["cpu", "memory"].includes(field) ? "desc" : "asc";
+    const icon = element("span", { class: "service-sort-icon", "aria-hidden": "true" },
+      active ? direction === "asc" ? "↑" : "↓" : "↕");
+    return element("th", { scope: "col", "aria-sort": active ? direction === "asc" ? "ascending" : "descending" : null },
+      button([label, icon], () => navigate(serviceLocation(field, next)), "", {
+        class: "service-sort", "data-sort": field, title: `${label}：${next === "asc" ? "升序" : "降序"}`,
+      }));
+  });
+  const empty = element("span", { "data-service-empty": true }, emptyServiceList());
+  const listing = scrollServiceList({
     source, state: fields.state.value, namespace: fields.namespace.disabled ? "" : fields.namespace.value, q: fields.q.value,
     host_id: isCluster(selected) || (!selected && source === "cluster") ? "" : requestedTarget,
     cluster_id: isCluster(selected) || (!selected && source === "cluster") ? requestedTarget : "",
     sort, direction,
-  }, (page) => {
-    const rows = items(page).map((service) => {
-      const deployment = isDeployment(service);
-      const state = element("div", {}, chip(service.state),
-        service.stale ? meta("数据已过期") : null,
-        meta(`采集 ${formatTime(service.observed_at)}`));
-      const action = service.state === "running" ? "stop" : "start";
-      // Keep an action placeholder for an unknown state so the user can see
-      // why it is unavailable; never send an action until a concrete state is
-      // observed and passes the backend preconditions.
-      const canDisplay = serviceStates.includes(service.state) || !service.state;
-      const explanation = serviceActionReason(service, action);
-      const disabled = Boolean(explanation);
-      return [element("div", {}, service.name,
-        meta(deployment ? `Deployment · 副本 ${display(service.ready)} / ${display(service.desired)}` : "systemd")),
+  }, [...columns, "操作"], (service) => {
+    const deployment = isDeployment(service);
+    const state = element("div", {}, chip(service.state),
+      service.stale ? meta("数据已过期") : null,
+      meta(`采集 ${formatTime(service.observed_at)}`));
+    const action = service.state === "running" ? "stop" : "start";
+    // Keep an action placeholder for an unknown state so the user can see
+    // why it is unavailable; never send an action until a concrete state is
+    // observed and passes the backend preconditions.
+    const canDisplay = serviceStates.includes(service.state) || !service.state;
+    const explanation = serviceActionReason(service, action);
+    const disabled = Boolean(explanation);
+    return [element("div", {}, service.name,
+      meta(deployment ? `Deployment · 副本 ${display(service.ready)} / ${display(service.desired)}` : "systemd")),
       element("div", {}, service.target_name, service.namespace ? meta(service.namespace) : null), state,
       element("span", { class: "service-resource", title: serviceResourceHint(service, "cpu_percent") }, Number.isFinite(service.cpu_percent) ? formatPercent(service.cpu_percent) : null),
       element("span", { class: "service-resource", title: serviceResourceHint(service, "memory_bytes") }, Number.isFinite(service.memory_bytes) ? formatBytes(service.memory_bytes) : null),
@@ -1049,20 +1187,7 @@ async function showServices(query, id) {
         canDisplay ? button(action === "start" ? "启动" : "停止", () => serviceAction(service.id, action),
           "secondary", { disabled, title: disabled ? explanation : null }) : null,
         button("创建告警", () => ruleEditor({ selector: serviceSelector(service), objectTitle: service.name })))];
-    });
-    const empty = element("span", { "data-service-empty": true }, emptyServiceList());
-    const columns = Object.entries(serviceColumns).map(([field, label]) => {
-      const active = field === sort;
-      const next = active ? direction === "asc" ? "desc" : "asc" : ["cpu", "memory"].includes(field) ? "desc" : "asc";
-      const icon = element("span", { class: "service-sort-icon", "aria-hidden": "true" },
-        active ? direction === "asc" ? "↑" : "↓" : "↕");
-      return element("th", { scope: "col", "aria-sort": active ? direction === "asc" ? "ascending" : "descending" : null },
-        button([label, icon], () => navigate(serviceLocation(field, next)), "", {
-          class: "service-sort", "data-sort": field, title: `${label}：${next === "asc" ? "升序" : "降序"}`,
-        }));
-    });
-    return [listTable("服务列表", [...columns, "操作"], rows, empty)];
-  });
+  }, empty, signal);
   let readVersion = 0;
   function publishObservations() {
     if (generation !== id) return;
@@ -1080,7 +1205,7 @@ async function showServices(query, id) {
   insert(id, heading("服务", [], true), filters, summary, listing);
   if (!requestedTarget || selected) mountCollection(id, scope, async () => {
     const revision = ++readVersion;
-    const before = allPages("/targets").catch(() => null);
+    const before = allPages("/targets", {}, { signal }).catch(() => null);
     await listing.refreshSnapshot();
     const updated = await before;
     if (revision !== readVersion) return;
@@ -1121,16 +1246,16 @@ async function serviceAction(serviceID, action) {
       if (needsReplicas) request.replicas = Number(replicas.value);
       if (confirmUnknown) request.confirm_unknown = true;
       const job = await api(`/services/${key(service.id || serviceID)}/actions`, "POST", request);
-      showTask(job?.job_id, { title: `${service.name} / ${label}` });
+      showTask(job?.job_id, { title: `${service.name} / ${label}`,
+        configureHostAccess: service.uses_host_login ? (errorCode) => {
+          const updating = errorCode === "service_helper_upgrade_required";
+          requestFirewallMaintenance({ id: service.target_id, name: service.target_name }, updating ? "update" : "install");
+        } : null,
+      });
     }, action === "stop" ? "danger" : "primary", "已在目标上核实当前服务状态，确认执行此操作");
   } catch (error) {
     notify(error.message);
   }
-}
-
-function targetSelect(targets, current, label = "主机") {
-  const node = select("id", targets.map((target) => [target.id, target.name]), current);
-  return { node, label: control(label, node) };
 }
 
 function detailsFor(target) {
@@ -1146,6 +1271,19 @@ function sourceErrorLabel(code) {
     firewall_unreadable: "防火墙读取未授权", permission_denied: "权限不足", authentication_failed: "认证失败",
     host_key_mismatch: "主机密钥不匹配", identity_changed: "目标身份已变化", timed_out: "采集超时",
     timeout: "采集超时", command_unavailable: "缺少采集命令", administrator_required: "需要管理员权限",
+    helper_migration_required: "旧版主机授权需要迁移",
+    maintenance_package_unavailable: "当前应用缺少所需的授权维护包。",
+    helper_update_not_installed: "未确认主机上有已安装的授权，请重新检测。",
+    helper_update_invalid: "主机拒绝了授权更新包，请检查发布签名和文件完整性。",
+    helper_update_architecture: "授权更新包与主机架构不匹配。",
+    helper_update_stale: "主机已有同版本或更高版本的授权。",
+    helper_update_host_state: "主机上的授权状态异常，请重新检测授权。",
+    service_not_granted: "当前主机授权无法启停该服务。",
+    service_helper_upgrade_required: "请更新主机授权后重试。",
+    service_action_not_run: "主机未执行该服务操作，请检查 systemd 状态。",
+    service_units_unconfirmed: "尚未核实所选服务的授权。请在主机上执行维护命令后重新检测。",
+    state_changed: "服务状态已变化，请重新采集后再试。",
+    object_changed: "服务已变更或未加载，请重新采集后再试。",
     connection_failed: "连接主机失败。请检查 SSH 连接后重试。",
     result_unconfirmed: "尚未确认远端操作结果。",
   })[code] || code;
@@ -1180,6 +1318,9 @@ function hostActions(target) {
   // from a readable snapshot produced by the installed helper.
   if (authorizationStatus !== "native") {
     const action = authorizationStatus === "installed" ? "uninstall" : "install";
+    if (action === "uninstall" && target.host_authorization_update_available) {
+      commands.push(["更新授权", () => requestFirewallMaintenance(target, "update")]);
+    }
     commands.push([action === "install" ? "安装授权" : "卸载授权", () => requestFirewallMaintenance(target, action)]);
   }
   commands.push(
@@ -1358,10 +1499,12 @@ async function showTargets(query, id) {
       const nodes = Number.isInteger(ready) && Number.isInteger(total) ? `${ready} / ${total}` : undefined;
       const actions = cluster ? clusterActions(target) : hostActions(target);
       if (cluster) return tableRow([first, connection, nodes, summary.abnormal_pods, actions], { class: "host-row", onclick: openHostRow });
+      const hostControls = target.host_authorization_up_to_date
+        ? element("div", {}, actions, meta(authorizationCurrentText)) : actions;
       const os = summary.os_info;
       const usage = summary.host_usage;
       const cells = [first, usageCell(usage?.cpu, true), usageCell(usage?.memory), usageCell(usage?.disk),
-        element("div", {}, display(os?.display_name)), element("div", {}, connection), actions];
+        element("div", {}, display(os?.display_name)), element("div", {}, connection), hostControls];
       return tableRow(cells, { class: "host-row", onclick: openHostRow });
     });
     return [listTable(tab === "hosts" ? "主机列表" : "集群列表", columns, rows, tab === "hosts" ? "尚未绑定 Linux 主机" : "尚未绑定 Kubernetes 集群")];
@@ -1633,7 +1776,7 @@ function unbind(target) {
     render();
   };
   actionForm(`确认解绑 ${target.name}？`, element("p", {},
-    host ? "确认后自动清理主机上的防火墙授权和暂存脚本。清理未验证时会保留绑定，解绑后停止采集、暂停关联规则并保留历史告警。"
+    host ? "确认后自动清理主机上的 Imon 授权和暂存脚本。清理未验证时会保留绑定，解绑后停止采集、暂停关联规则并保留历史告警。"
       : "解绑后将停止采集并暂停关联规则，历史告警仍可查看。"),
   "确认解绑", remove, "danger", "已核实目标上的上次操作，确认解绑并保留历史记录");
 }
@@ -1775,36 +1918,51 @@ async function serviceAuthorization(target) {
   }
 }
 
-const firewallStatusText = { installed: "已安装", uninstalled: "未安装", unknown: "待核实", pending: "检查中" };
+const firewallStatusText = { installed: "已安装", uninstalled: "未安装", native: "已有权限", unknown: "待核实", pending: "检查中" };
+const authorizationCurrentText = "已是最新版本";
 
-function firewallTaskOptions(target, action) {
-  const title = `${action === "install" ? "安装授权" : "卸载授权"} / ${target.name}`;
+function refreshHostAuthorization(targetID) {
+  if (workspace.hidden) return;
+  const query = routeQuery();
+  const view = query.get("view") || "targets";
+  if (view === "targets" && query.get("tab") !== "clusters") {
+    render({ quiet: true });
+  } else if (["network", "metrics", "services"].includes(view)) {
+    const selected = query.get(view === "services" ? "target" : "id");
+    if (!selected || selected === targetID) render({ quiet: true });
+  }
+}
+
+function firewallTaskOptions(target, action, label, updating) {
+  const title = `${label} / ${target.name}`;
   const options = {
     title,
     operation: action,
+    label,
+    updating,
     administrator: () => firewallCredentialForm(target, action, options),
     upload: (id) => api(`${targetPath(target.id)}/maintenance/upload`, "POST", { action, auto_job_id: id }),
     verify: () => firewallCredentialForm(target, "verify", options),
     retryVerify: true,
+    refreshAfterSuccess: () => refreshHostAuthorization(target.id),
   };
   return options;
 }
 
-function requestFirewallMaintenance(target, action) {
-  const installing = action === "install";
-  const label = installing ? "安装授权" : "卸载授权";
-  const description = installing
-    ? "通过 SSH 在目标主机安装防火墙只读采集助手。服务启停授权不受影响。"
-    : "通过 SSH 从目标主机卸载防火墙只读采集助手。服务启停授权不受影响。";
-  actionForm(`${label} / ${target.name}`, element("p", {}, description), label, async () => {
-    const job = await api(`/hosts/${key(target.id)}/firewall-maintenance`, "POST", { action });
-    showTask(job?.job_id, firewallTaskOptions(target, action));
-  }, installing ? "primary" : "danger");
+async function requestFirewallMaintenance(target, operation) {
+  const updating = operation === "update";
+  const label = updating ? "更新授权" : operation === "install" ? "安装授权" : "卸载授权";
+  try {
+    const job = await api(`/hosts/${key(target.id)}/firewall-maintenance`, "POST", { action: operation });
+    showTask(job?.job_id, firewallTaskOptions(target, operation, label, updating));
+  } catch (error) {
+    notify(error.message);
+  }
 }
 
 function firewallCredentialForm(target, action, options) {
   const verifying = action === "verify";
-  const label = verifying ? "重新检测授权" : action === "install" ? "安装授权" : "卸载授权";
+  const label = verifying ? "重新检测授权" : options.updating ? "迁移授权" : options.label;
   const adminUser = input("admin_user", "", { placeholder: "<管理员登录用户>" });
   const adminKey = input("admin_key_file", "", { placeholder: "<本机管理员 SSH 私钥绝对路径>" });
   const useAdmin = verifying ? checkbox("use_admin", false) : null;
@@ -1836,7 +1994,7 @@ function firewallCredentialForm(target, action, options) {
           credential_ref: { ssh: { user: adminUser.value.trim(), key_file: adminKey.value.trim() } },
         } : {}),
       });
-      if (form.isConnected && dialog.open) showTask(job?.job_id, options);
+      if (form.isConnected && dialog.open) showTask(job?.job_id, verifying ? { ...options, updating: false } : options);
     } catch (failure) {
       formError(error, failure);
       commit.disabled = false;
@@ -1845,24 +2003,29 @@ function firewallCredentialForm(target, action, options) {
   showDialog(`${label} / ${target.name}`, form);
 }
 
-function firewallAuthorizationInfo(target) {
-  const state = meta("防火墙授权：检查中");
+function firewallAuthorizationInfo(target, offerUpdate = false) {
+  const state = meta("主机授权：检查中");
+  const statusLine = offerUpdate ? element("div", { class: "actions" }, state) : state;
   get(`/hosts/${key(target.id)}/firewall-authorization`).then((authorization) => {
     const status = firewallStatusText[authorization.status] || firewallStatusText.unknown;
     const available = authorization.update_available && authorization.available_display_version
       ? `可用版本 ${authorization.available_display_version}` : "";
-    state.textContent = [`防火墙授权：${status}`, authorization.installed_display_version, available].filter(Boolean).join(" · ");
+    state.textContent = [`主机授权：${status}`, authorization.installed_display_version,
+      authorization.up_to_date ? authorizationCurrentText : available].filter(Boolean).join(" · ");
+    if (offerUpdate && authorization.update_available) {
+      statusLine.append(button("更新授权", () => requestFirewallMaintenance(target, "update")));
+    }
   }).catch(() => {
-    state.textContent = "防火墙授权：待核实";
+    state.textContent = "主机授权：待核实";
   });
-  return state;
+  return statusLine;
 }
 
 function unbindTaskOptions(target, retry, action = "uninstall") {
   const title = `解绑 / ${target.name}`;
   const verify = () => unbindCleanupForm(target, retry, "verify");
   return {
-    title, verify, retryVerify: action === "verify",
+    title, operation: action, verify, retryVerify: action === "verify",
     administrator: action === "uninstall" ? () => unbindCleanupForm(target, retry, "uninstall") : undefined,
     upload: action === "uninstall" ? (id) => api(`${targetPath(target.id)}/maintenance/upload`, "POST", { action, auto_job_id: id }) : undefined,
     complete: async (job, result) => {
@@ -1970,10 +2133,17 @@ function updateSnapshotTime(node, page, fallback) {
   node.textContent = snapshotTime(page, fallback);
 }
 
-function targetContext(targets, target, label = "主机") {
-  const picker = targetSelect(targets, target.id, label);
-  picker.label.classList.add("target-context-control");
-  return picker;
+function targetContext(targets, target, label = "选择主机") {
+  const entries = targets.map((entry) => [entry.id, entry.name]);
+  if (!target) entries.unshift(["", label]);
+  const node = select("id", entries, target?.id ?? "");
+  node.setAttribute("aria-label", label);
+  if (!target) node.options[0].disabled = true;
+  // Let the native select handle interaction while the title text can truncate.
+  const control = element("span", { class: "target-context-control" },
+    element("span", { class: "target-context-name", "aria-hidden": "true" }, target?.name ?? label),
+    element("span", { class: "dropdown-arrow", "aria-hidden": "true" }), node);
+  return { node, control };
 }
 
 function snapshotContext() {
@@ -2095,7 +2265,7 @@ async function showMetrics(query, id) {
   const oldLists = !content.inert && content.querySelectorAll(".metric-inventories .inventory");
   const scroll = oldLists && Array.from(oldLists, (node) => ({ left: node.scrollLeft, top: node.scrollTop }));
   insert(id, heading("主机详情", [link("主机管理", locationFor("targets"), "secondary"),
-    link("网络详情", locationFor("network", { id: target.id }), "secondary")], true, [host.label, lastSuccess]),
+    link("网络详情", locationFor("network", { id: target.id }), "secondary")], true, { picker: host, lastSuccess }),
   element("div", { class: "toolbar" }, control("时间范围", range), firewallAuthorizationInfo(target)), cards,
   element("div", { class: "metric-inventories" },
     element("section", {}, element("h2", {}, "磁盘"), diskList),
@@ -2220,9 +2390,9 @@ async function showNetwork(query, id) {
   const requested = query.get("tab");
   const group = Object.hasOwn(networkTabs, requested) ? requested : "interfaces";
   if (!target) {
-    const host = targetSelect(targets, "", "选择主机");
-    selectedTargetChange(host, "network", { tab: group });
-    insert(id, heading("网络", [], false, targets.length ? [host.label] : []),
+    const host = targets.length ? targetContext(targets, null) : null;
+    if (host) selectedTargetChange(host, "network", { tab: group });
+    insert(id, heading("网络", [], false, host && { picker: host }),
       notice(query.get("id") ? "此主机已解绑或不存在。" : "尚未绑定 Linux 主机。"),
       null);
     return;
@@ -2239,10 +2409,13 @@ async function showNetwork(query, id) {
   selectedTargetChange(host, "network", { tab: group });
   const listing = pageList(`/hosts/${key(target.id)}/network/${group}`, {}, (page) => {
     updateSnapshotTime(lastSuccess, page, target.last_success_at);
-    return [listTable(networkTabs[group], headers[group], getNetworkRows(group, snapshotItems(page)), snapshotEmpty(page, "采集成功，未发现数据")),
-      group === "firewall" ? firewallAuthorizationInfo(target) : null].filter(Boolean);
+    const rows = snapshotItems(page);
+    return [listTable(networkTabs[group], headers[group], getNetworkRows(group, rows), snapshotEmpty(page, "采集成功，未发现数据")),
+      group === "listeners" && rows.some((row) => !row.process && row.process_state === "unreadable")
+        ? meta("部分端口的进程不可读。可查看下方的主机授权状态。内核套接字等可能没有可显示的进程。") : null,
+      ["firewall", "listeners"].includes(group) ? firewallAuthorizationInfo(target, true) : null].filter(Boolean);
   });
-  insert(id, heading("网络", [link("主机详情", detailsFor(target), "secondary")], true, [host.label, lastSuccess]),
+  insert(id, heading("网络", [link("主机详情", detailsFor(target), "secondary")], true, { picker: host, lastSuccess }),
     element("div", { class: "toolbar" }, meta("只读")),
     tabs(Object.entries(networkTabs).map(([tab, label]) => [tab, label, locationFor("network", { id: target.id, tab })]), group),
     listing);
@@ -2277,7 +2450,7 @@ async function showCluster(query, id) {
   const tab = Object.hasOwn(clusterTabs, chosen) ? chosen : "namespaces";
   const namespace = tab !== "nodes" ? query.get("namespace") || "" : "";
   const path = `/clusters/${key(target.id)}/resources/`;
-  const cluster = targetContext(targets, target, "集群");
+  const cluster = targetContext(targets, target, "选择集群");
   selectedTargetChange(cluster, "cluster", { tab });
   const status = target.connection_status || target.status || "pending";
   const lastSuccess = snapshotContext();
@@ -2322,7 +2495,7 @@ async function showCluster(query, id) {
       snapshotEmpty(page, namespace ? "未找到匹配项" : "采集成功，未发现数据"))].filter(Boolean);
   });
   insert(id, heading("集群详情", [link("主机管理", locationFor("targets", { tab: "clusters" }), "secondary")], true,
-    [cluster.label, lastSuccess]),
+    { picker: cluster, lastSuccess }),
     filter, tabs(Object.entries(clusterTabs).map(([name, label]) => [name, label,
       locationFor("cluster", { id: target.id, tab: name, namespace: ["nodes", "namespaces"].includes(name) ? "" : namespace }),
     ]), tab), listing);
@@ -2869,28 +3042,39 @@ function closeVersion(restoreFocus = false) {
   if (restoreFocus) versionTrigger.focus();
 }
 
+function githubUpdateLink(value, label) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.origin === "https://github.com" && !url.username && !url.password) {
+      // Desktop WebViews hand same-frame external navigation to the system browser.
+      return element("a", { href: url.href, target: desktop ? undefined : "_blank", rel: "noopener noreferrer" }, label);
+    }
+  } catch { /* Ignore invalid URLs returned by older versions. */ }
+  return null;
+}
+
 function showVersionStatus() {
   const newer = updateInfo?.tag && ["available", "asset_missing", "asset_unverified"].includes(updateInfo.state);
   versionNumber.textContent = localVersion?.current || "";
   versionTrigger.hidden = !localVersion?.current;
   updateDot.hidden = !newer;
   versionTrigger.setAttribute("aria-label", newer ? `${localVersion.current}，有新版本` : localVersion?.current || "客户端版本");
-  let releaseLink;
-  if (newer && updateInfo.release_url) {
-    try {
-      const url = new URL(updateInfo.release_url);
-      if (url.origin === "https://github.com") releaseLink = element("a", { href: url.href, target: "_blank", rel: "noopener noreferrer" }, "在 GitHub 查看发布版本");
-    } catch { /* The version can still be displayed without a link. */ }
-  }
+  const repository = updateInfo?.repository || localVersion?.repository;
+  const repositoryLink = githubUpdateLink(updateInfo?.repository_url || localVersion?.repository_url,
+    repository ? `GitHub Releases · ${repository}` : "GitHub Releases");
+  const releaseLink = newer ? githubUpdateLink(updateInfo.release_url, "在 GitHub 查看发布版本") : null;
   const mayApply = updateInfo?.state === "available" && updateInfo.can_apply;
-  const status = versionFeedback || (updateInfo?.state === "available" && !mayApply ? "当前安装方式不支持自动更新。" :
+  const assetLink = newer && !mayApply ? githubUpdateLink(updateInfo.asset_url, "下载安装包") : null;
+  const status = versionFeedback || (updateInfo?.state === "available" && !mayApply ? "请下载适用于当前系统的安装包进行更新。" :
     updateMessages[updateInfo?.state] || (updateInfo ? "" : "正在检查更新…"));
-  versionPopover.replaceChildren(element("h2", {}, newer ? `新版本 ${updateInfo.tag}` : `当前版本 ${localVersion?.current || ""}`),
+  versionPopover.replaceChildren(...[element("h2", {}, newer ? `新版本 ${updateInfo.tag}` : `当前版本 ${localVersion?.current || ""}`),
     newer && updateInfo.release_name && updateInfo.release_name !== updateInfo.tag ? element("p", {}, updateInfo.release_name) : null,
     newer && updateInfo.release_notes ? element("p", { class: "release-notes muted" }, updateInfo.release_notes) : null,
     status ? notice(status, versionFailed) : null,
-    releaseLink || mayApply ? element("div", { class: "actions" }, releaseLink,
-      mayApply ? button("更新", applyUpdate, "primary", { disabled: updateRunning }) : null) : null);
+    releaseLink || assetLink || mayApply ? element("div", { class: "actions" }, releaseLink, assetLink,
+      mayApply ? button("更新", applyUpdate, "primary", { disabled: updateRunning }) : null) : null,
+    repositoryLink].filter(Boolean));
 }
 
 async function checkVersionAtStartup() {

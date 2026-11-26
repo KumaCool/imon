@@ -15,15 +15,20 @@ import (
 )
 
 type MaintenanceResult struct {
-	Status        string `json:"status"`
-	Version       string `json:"version,omitempty"`
-	Architecture  string `json:"architecture,omitempty"`
-	MarkersAbsent bool   `json:"markers_absent,omitempty"`
-	StagedPath    string `json:"staged_path,omitempty"`
-	SHA256        string `json:"sha256,omitempty"`
+	Status                 string `json:"status"`
+	Version                string `json:"version,omitempty"`
+	PreviousVersion        string `json:"-"` // Digest observed before a manual migration.
+	LegacyServiceUnitsHash string `json:"-"`
+	Architecture           string `json:"architecture,omitempty"`
+	MarkersAbsent          bool   `json:"markers_absent,omitempty"`
+	StagedPath             string `json:"staged_path,omitempty"`
+	SHA256                 string `json:"sha256,omitempty"`
 }
 
-const FirewallAdministratorRequired = "administrator_required"
+const (
+	FirewallAdministratorRequired = "administrator_required"
+	FirewallMigrationRequired     = "helper_migration_required"
+)
 
 var (
 	maintenanceUser = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$")
@@ -72,9 +77,9 @@ inspect_layout() {
   auth_dir=/etc/sudoers.d
   sudoers=$auth_dir/$1-firewall
   if absent "$helper" && absent "$manifest"; then
-    if ! absent "$state/firewall.lock" ||
-      ! temporary_area_clear "$state" "$state"/.stage.???????? ||
-      ! temporary_area_clear "$lib" "$lib"/.reader.????????; then
+    if ! absent "$state/firewall.lock" || ! absent "$state/service-units" ||
+      ! temporary_area_clear "$state" "$state"/.stage.???????? "$state"/.helper-next.json "$state"/.helper-next.json.tmp ||
+      ! temporary_area_clear "$lib" "$lib"/.reader.???????? "$lib"/.helper-next; then
       printf '%s\n' unknown
     elif absent "$sudoers" && temporary_area_clear "$auth_dir" "$auth_dir"/.$1.????????; then
       printf '%s\n' uninstalled
@@ -106,6 +111,50 @@ esac`
 const stageOnlyCommand = "set -eu; umask 077; dir=$(/usr/bin/mktemp -d /var/tmp/imon-upload.XXXXXXXX); target=$dir/firewall-maintain.sh; trap 'rm -f -- \"$target\"; rmdir -- \"$dir\"' EXIT; imon_payload > \"$target\"; /usr/bin/chmod 0600 \"$target\"; printf '%s\\n' \"$target\"; trap - EXIT"
 
 const stageSFTPCommand = "set -eu; umask 077; dir=$(/usr/bin/mktemp -d /var/tmp/imon-upload.XXXXXXXX); printf '%s/firewall-maintain.sh\\n' \"$dir\""
+
+// Read the legacy digest only when verifying scripts staged by an older version.
+const legacyServiceUnitsHashCommand = locale + helperPathCommand + `
+[ -x "$helper" ] || exit 127
+exec sudo -n -- "$helper" grants`
+
+const autoMaintenanceProbe = "sudo -n -- /bin/sh -c '/usr/bin/id -u'"
+
+// A sudo rule listing can succeed even when execution requires a password.
+// If version is unavailable, verify the original no-argument read directly.
+const helperVersionCommand = locale + helperPathCommand + `
+if sudo -n -- "$helper" version 2>/dev/null; then
+  :
+else
+  status=$?
+  if [ "$status" = 1 ] && sudo -n -- "$helper" >/dev/null 2>&1; then
+    printf '%s\n' imon:helper-legacy
+  else
+    printf 'imon:helper-exit %s\n' "$status"
+  fi
+fi`
+
+const helperUpdateCommand = locale + helperPathCommand + `
+if imon_payload | sudo -n -- "$helper" update 2>/dev/null; then
+  :
+else
+  printf 'imon:helper-exit %s\n' "$?"
+fi`
+
+const helperUninstallCommand = locale + helperPathCommand + `
+if sudo -n -- "$helper" uninstall </dev/null 2>/dev/null; then
+  :
+else
+  printf 'imon:helper-exit %s\n' "$?"
+fi`
+
+func (s *sshConnection) legacyServiceUnitsHash(ctx context.Context) string {
+	data, err := s.runLimited(ctx, legacyServiceUnitsHashCommand, 1024)
+	digest := strings.TrimSpace(string(data))
+	if err == nil && maintenanceHash.MatchString(digest) {
+		return digest
+	}
+	return ""
+}
 
 func (s *sshConnection) stageWithSFTP(ctx context.Context, script []byte) (string, error) {
 	if ctx.Err() != nil {
@@ -194,13 +243,6 @@ func inspectFirewall(ctx context.Context, cfg Config, identity string, verifyRul
 	if err != nil && Code(err) != "unsupported_architecture" && Code(err) != "command_unavailable" {
 		return result, err
 	}
-	if _, native, nativeErr := s.ssh.nativeFirewall(ctx); native {
-		if nativeErr != nil {
-			return result, nativeErr
-		}
-		result.Status = "native"
-		return result, nil
-	}
 	output, err := s.ssh.runLimited(ctx, inspectFirewallCommand, 1024)
 	if err != nil {
 		return result, err
@@ -211,6 +253,10 @@ func inspectFirewall(ctx context.Context, cfg Config, identity string, verifyRul
 		result.MarkersAbsent = true
 		if probe == "uninstalled" {
 			result.Status = probe
+			uid, err := s.ssh.runLimited(ctx, locale+"id -u", 1024)
+			if err == nil && strings.TrimSpace(string(uid)) == "0" {
+				result.Status = "native"
+			}
 		}
 	case "unknown":
 	default:
@@ -227,10 +273,142 @@ func inspectFirewall(ctx context.Context, cfg Config, identity string, verifyRul
 			if len(rows) == 0 {
 				return result, fail("result_unconfirmed")
 			}
+			result.LegacyServiceUnitsHash = s.ssh.legacyServiceUnitsHash(ctx)
 		}
 		result.Status, result.Version = "installed", digest
 	}
 	return result, nil
+}
+
+// UpdateFirewall sends the signed release to the fixed update operation of an
+// installed helper. The old helper's exit status and the new helper's readback
+// are checked separately from the SSH command's transport status.
+func UpdateFirewall(ctx context.Context, cfg Config, expectedIdentity, arch, expectedVersion string, updatePackage []byte) (MaintenanceResult, error) {
+	result := MaintenanceResult{Architecture: arch}
+	if expectedIdentity == "" || !maintenanceUser.MatchString(cfg.SSH.User) || cfg.SSH.User == "root" || !maintenanceHash.MatchString(expectedVersion) {
+		return result, fail("invalid_maintenance")
+	}
+	if len(updatePackage) == 0 || len(updatePackage) > 32<<20 {
+		return result, fail("maintenance_package_unavailable")
+	}
+	s, err := Open(ctx, "host", cfg, expectedIdentity)
+	if err != nil {
+		return result, err
+	}
+	defer s.Close()
+	installed := func(output []byte) string {
+		digest, ok := strings.CutPrefix(strings.TrimSpace(string(output)), "installed ")
+		if ok && maintenanceHash.MatchString(digest) {
+			return digest
+		}
+		return ""
+	}
+	probe := func() ([]byte, error) {
+		probeCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+		defer stop()
+		return s.ssh.runLimited(probeCtx, helperVersionCommand, 1024)
+	}
+	output, err := s.ssh.runLimited(ctx, inspectFirewallCommand, 1024)
+	if err != nil {
+		return result, err
+	}
+	previousVersion := installed(output)
+	if previousVersion == "" {
+		return result, fail("helper_update_not_installed")
+	}
+	output, err = probe()
+	if err != nil {
+		return result, err
+	}
+	if strings.TrimSpace(string(output)) == "imon:helper-legacy" {
+		result.PreviousVersion = previousVersion
+		return result, fail(FirewallMigrationRequired)
+	}
+	current := installed(output)
+	if current == "" {
+		return result, fail("helper_update_host_state")
+	}
+	if current == expectedVersion {
+		result.Status, result.Version = "verified", current
+		return result, nil
+	}
+	updateCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
+	output, err = s.ssh.runInput(updateCtx, helperUpdateCommand, 1024, updatePackage)
+	stop()
+	if err != nil {
+		result.Status = "unknown"
+		return result, err
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "imon:helper-exit 2":
+		return result, fail("helper_update_invalid")
+	case "imon:helper-exit 3":
+		return result, fail("helper_update_architecture")
+	case "imon:helper-exit 4":
+		// Another panel may have already applied the same release. Confirm
+		// the currently installed digest before treating this as success.
+		output, err = probe()
+		if err != nil {
+			result.Status = "unknown"
+			return result, err
+		}
+		if installed(output) != expectedVersion {
+			return result, fail("helper_update_stale")
+		}
+		result.Status, result.Version = "verified", expectedVersion
+		return result, nil
+	case "imon:helper-exit 5":
+		result.Status = "unknown"
+		return result, fail("helper_update_host_state")
+	}
+	if installed(output) != expectedVersion {
+		result.Status = "unknown"
+		return result, fail("result_unconfirmed")
+	}
+	output, err = probe()
+	if err != nil {
+		result.Status = "unknown"
+		return result, err
+	}
+	if installed(output) != expectedVersion {
+		result.Status = "unknown"
+		return result, fail("result_unconfirmed")
+	}
+	result.Status, result.Version = "verified", expectedVersion
+	return result, nil
+}
+
+// UninstallFirewall invokes only the exact uninstall rule installed with the
+// host helper. The helper verifies removal with root access before reporting it.
+func UninstallFirewall(ctx context.Context, cfg Config, expectedIdentity string) (MaintenanceResult, error) {
+	var result MaintenanceResult
+	if expectedIdentity == "" || !maintenanceUser.MatchString(cfg.SSH.User) || cfg.SSH.User == "root" {
+		return result, fail("invalid_maintenance")
+	}
+	s, err := Open(ctx, "host", cfg, expectedIdentity)
+	if err != nil {
+		return result, err
+	}
+	defer s.Close()
+	uninstallCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	output, err := s.ssh.runLimited(uninstallCtx, helperUninstallCommand, 1024)
+	if err != nil {
+		result.Status = "unknown"
+		return result, err
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "uninstalled":
+		result.Status, result.MarkersAbsent = "uninstalled", true
+		return result, nil
+	case "imon:helper-exit 1":
+		// sudo denied the command or an older helper rejected the subcommand.
+		// A helper that implements uninstall reserves this code for neither.
+		return result, fail(FirewallAdministratorRequired)
+	default:
+		result.Status = "unknown"
+		return result, fail("result_unconfirmed")
+	}
 }
 
 // MaintainFirewall inspects or updates only the embedded maintenance package.
@@ -242,9 +420,6 @@ func MaintainFirewall(ctx context.Context, cfg Config, admin *Config, expectedId
 	}
 	if (action != "verify" || admin != nil) && (len(script) == 0 || len(script) > 32<<20) {
 		return result, fail("maintenance_package_unavailable")
-	}
-	if action != "verify" && admin == nil {
-		return result, fail(FirewallAdministratorRequired)
 	}
 	if action == "verify" && admin == nil {
 		return inspectFirewall(ctx, cfg, expectedIdentity, true)
@@ -259,6 +434,9 @@ func MaintainFirewall(ctx context.Context, cfg Config, admin *Config, expectedId
 	}
 	digest := sha256.Sum256(script)
 	result.SHA256 = hex.EncodeToString(digest[:])
+	remote := s
+	launcher := "sudo -n -- "
+	privilegeProbe := autoMaintenanceProbe
 	if admin != nil {
 		// Connection location and pinned keys come from the existing binding.
 		// Administrator credentials can only replace the target login identity.
@@ -268,7 +446,7 @@ func MaintainFirewall(ctx context.Context, cfg Config, admin *Config, expectedId
 		if !maintenanceUser.MatchString(privileged.SSH.User) || privileged.SSH.KeyFile == "" || privileged.SSH.User == cfg.SSH.User || privileged.SSH.KeyFile == cfg.SSH.KeyFile {
 			return result, fail("invalid_maintenance_credential")
 		}
-		remote, err := Open(ctx, "host", privileged, expectedIdentity)
+		remote, err = Open(ctx, "host", privileged, expectedIdentity)
 		if err != nil {
 			if action != "verify" {
 				switch Code(err) {
@@ -279,66 +457,62 @@ func MaintainFirewall(ctx context.Context, cfg Config, admin *Config, expectedId
 			return result, err
 		}
 		defer remote.Close()
-		launcher := "sudo -n -- "
-		privilegeProbe := "sudo -n -- /usr/bin/id -u"
 		if privileged.SSH.User == "root" {
 			launcher = ""
 			privilegeProbe = "/usr/bin/id -u"
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		output, probeErr := remote.ssh.runLimited(probeCtx, privilegeProbe, 1024)
-		cancel()
-		switch Code(probeErr) {
-		case "":
-			if strings.TrimSpace(string(output)) != "0" {
-				if action != "verify" {
-					return result, fail(FirewallAdministratorRequired)
-				}
-				return result, fail("administrator_unverified")
-			}
-			body := "set -eu; umask 077; dir=$(/usr/bin/mktemp -d /var/tmp/imon-admin.XXXXXXXX); target=$dir/firewall-maintain.sh; trap 'rm -f -- \"$target\"; rmdir -- \"$dir\"' EXIT; /bin/cat > \"$target\"; printf '%s  %s\\n' '" + result.SHA256 + "' \"$target\" | /usr/bin/sha256sum -c - >/dev/null; /bin/sh \"$target\" " + action + " --collector " + cfg.SSH.User
-			installCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
-			output, runErr := remote.ssh.runInput(installCtx, "imon_payload | "+launcher+"/bin/sh -c "+shellQuote(body), 4096, script)
-			stop()
-			if runErr != nil {
-				result.Status = "unknown"
-				return result, runErr
-			}
-			result.Status = "unknown"
-			probe := strings.TrimSpace(string(output))
-			if probe == "uninstalled" && (action == "verify" || action == "uninstall") {
-				result.Status, result.MarkersAbsent = "uninstalled", true
-				if action == "uninstall" {
-					result.Status = "verified"
-				}
-				return result, nil
-			}
-			if digest, ok := strings.CutPrefix(probe, "installed "); ok && maintenanceHash.MatchString(digest) && (action == "verify" || action == "install") {
-				rows, readErr := s.ssh.firewall(ctx)
-				if readErr != nil {
-					return result, readErr
-				}
-				if len(rows) == 0 {
-					return result, fail("result_unconfirmed")
-				}
-				result.Status, result.Version = "installed", digest
-				if action == "install" {
-					result.Status = "verified"
-				}
-				return result, nil
-			}
-			return result, fail("result_unconfirmed")
-		case "permission_denied", "command_failed", "command_unavailable":
-			// The fixed probe cannot change the remote host.
-			if action == "verify" {
-				return result, probeErr
-			}
-			return result, fail(FirewallAdministratorRequired)
-		default:
-			return result, probeErr
-		}
 	}
-	return result, fail(FirewallAdministratorRequired)
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	output, probeErr := remote.ssh.runLimited(probeCtx, privilegeProbe, 1024)
+	cancel()
+	if probeErr != nil {
+		switch Code(probeErr) {
+		case "permission_denied", "command_failed", "command_unavailable":
+			if action != "verify" {
+				return result, fail(FirewallAdministratorRequired)
+			}
+		}
+		return result, probeErr
+	}
+	if strings.TrimSpace(string(output)) != "0" {
+		if action != "verify" {
+			return result, fail(FirewallAdministratorRequired)
+		}
+		return result, fail("administrator_unverified")
+	}
+	body := "set -eu; umask 077; dir=$(/usr/bin/mktemp -d /var/tmp/imon-admin.XXXXXXXX); target=$dir/firewall-maintain.sh; trap 'rm -f -- \"$target\"; rmdir -- \"$dir\"' EXIT; /bin/cat > \"$target\"; printf '%s  %s\\n' '" + result.SHA256 + "' \"$target\" | /usr/bin/sha256sum -c - >/dev/null; /bin/sh \"$target\" " + action + " --collector " + cfg.SSH.User
+	installCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
+	output, err = remote.ssh.runInput(installCtx, "imon_payload | "+launcher+"/bin/sh -c "+shellQuote(body), 4096, script)
+	stop()
+	result.Status = "unknown"
+	if err != nil {
+		return result, err
+	}
+	probe := strings.TrimSpace(string(output))
+	if probe == "uninstalled" && (action == "verify" || action == "uninstall") {
+		result.Status, result.MarkersAbsent = "uninstalled", true
+		if action == "uninstall" {
+			result.Status = "verified"
+		}
+		return result, nil
+	}
+	if digest, ok := strings.CutPrefix(probe, "installed "); ok && maintenanceHash.MatchString(digest) && (action == "verify" || action == "install") {
+		rows, readErr := s.ssh.firewall(ctx)
+		if readErr != nil {
+			return result, readErr
+		}
+		if len(rows) == 0 {
+			return result, fail("result_unconfirmed")
+		}
+		result.Status, result.Version = "installed", digest
+		if action == "install" {
+			result.Status = "verified"
+		} else {
+			result.LegacyServiceUnitsHash = s.ssh.legacyServiceUnitsHash(ctx)
+		}
+		return result, nil
+	}
+	return result, fail("result_unconfirmed")
 }
 
 // StageFirewall uploads the embedded package as the bound collector account.

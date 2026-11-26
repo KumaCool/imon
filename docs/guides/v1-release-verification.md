@@ -55,7 +55,7 @@ rollback: v1.0.0 (rolled_back); same address, session and settings
 ```sh
 go test -count=1 -race ./...
 go vet ./...
-./packaging/release/build.sh v1.0.0 dist/final
+IMON_ALLOW_UNSIGNED_HELPER=1 ./packaging/release/build.sh v1.0.0 dist/final
 (cd dist/final/v1.0.0 && shasum -a 256 -c SHA256SUMS)
 unzip -t dist/final/v1.0.0/imon-web_windows_amd64.zip
 unzip -t dist/final/v1.0.0/imon-web_windows_arm64.zip
@@ -160,3 +160,23 @@ start: convergence=confirmed, state=running, desired=2, ready=2, resume=None
 | --- | --- | --- | --- | --- |
 | 12 | 29,240 | 1.667 | 221,184 → 1,396,736 | 312 / 336 / 341 |
 | 48 | 32,532 | 6.651 | 237,568 → 4,775,936 | 1,105 / 1,142 / 1,166 |
+
+## 主机辅助程序自更新
+
+使用一次性签名密钥构建测试辅助程序，在隔离的 Debian 12 amd64 环境运行 SSH、sudo 和 systemd 验证。构建及远端测试均退出 `0`。
+
+```sh
+GO_BIN='<GO_EXECUTABLE>' /bin/sh packaging/linux-smoke/build.sh amd64 '<EXISTING_FIXTURE_OUTPUT_DIR>'
+```
+
+将测试文件复制到隔离环境的 `/fixture` 后执行 `sudo /bin/sh /fixture/fixture.sh`。该环境安装了 sudo、fish、OpenSSH、iproute2、nftables 和 UFW。关键输出如下。
+
+```text
+Legacy helper required one administrator migration and removed obsolete per-service grants
+Tampered update rejected and previous helper digest preserved
+Restricted SSH account installed and verified the signed update
+Downgrade rejected and updated helper still reads port processes and controls systemd services
+Firewall rules unchanged; systemd enabled before=enabled after=enabled, final state=active
+```
+
+Linux 回归测试 `TestHelperRestoresBinaryIfManifestActivationFails` 模拟执行文件替换后写入清单失败，确认原执行文件和原清单均已恢复。

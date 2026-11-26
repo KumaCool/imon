@@ -22,6 +22,7 @@ arch=${3:-$("$go_bin" env GOHOSTARCH)}
 case "$arch" in amd64|arm64) ;; *) usage ;; esac
 
 src=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)
+repo=$(sh "$src/packaging/release/repository.sh" "$src")
 out_parent=${2:-"$src/dist/desktop"}
 mkdir -p -- "$out_parent/$tag"
 out_parent=$(CDPATH='' cd -- "$out_parent/$tag" && pwd -P)
@@ -37,20 +38,15 @@ app="$work/Imon.app"
 mkdir -p "$work/src" "$work/assets" "$app/Contents/MacOS" "$app/Contents/Resources/Licenses"
 cp "$src/go.mod" "$src/go.sum" "$work/src/"
 cp -R "$src/cmd" "$src/internal" "$src/web" "$work/src/"
+sh "$src/packaging/release/build-helpers.sh" "$tag" "$go_bin" "$work/src"
 cd "$work/src"
 export GOFLAGS='' GOWORK=off GOAMD64=v1 GOARM64=v8.0
-for target in amd64 arm64; do
-  printf 'Building Linux firewall reader (%s)\n' "$target"
-  CGO_ENABLED=0 GOOS=linux GOARCH="$target" "$go_bin" build -buildvcs=false -trimpath -ldflags='-s -w' \
-    -o "internal/firewall/bundles/firewall-read-$target" ./cmd/imon-firewall
-done
-IMON_REQUIRE_BUNDLES=1 CGO_ENABLED=0 GOOS=darwin GOARCH=$("$go_bin" env GOHOSTARCH) \
-  "$go_bin" test -count=1 ./internal/firewall
 
 CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" MACOSX_DEPLOYMENT_TARGET=13.0 \
-  "$go_bin" build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=$tag" \
+  "$go_bin" build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=$tag -X main.defaultReleaseRepo=$repo" \
   -o "$app/Contents/MacOS/imon-desktop" ./cmd/imon-desktop
 cp "$src/packaging/desktop/Info.plist" "$app/Contents/Info.plist"
+cp "$src/packaging/desktop/imon.icns" "$app/Contents/Resources/"
 plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$version" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"

@@ -15,18 +15,20 @@ import (
 	"imon/internal/update"
 )
 
-var version = "v0.1.0"
+var version = "v0.1.1"
+var defaultReleaseRepo string
 
 func init() {
 	runtime.LockOSThread()
 }
 
 func main() {
-	var dir, backupPath, restorePath string
+	var dir, backupPath, restorePath, repo string
 	var showVersion bool
 	flag.StringVar(&dir, "data-dir", "", "use this private data directory instead of the per-user default")
 	flag.StringVar(&backupPath, "backup", "", "save a SQLite backup to a new file")
 	flag.StringVar(&restorePath, "restore", "", "restore a SQLite backup while the panel is stopped")
+	flag.StringVar(&repo, "release-repo", defaultReleaseRepo, "public GitHub release repository (owner/repo)")
 	flag.BoolVar(&showVersion, "version", false, "print the local application version")
 	flag.Parse()
 	if flag.NArg() != 0 || backupPath != "" && restorePath != "" {
@@ -44,7 +46,7 @@ func main() {
 	if isDatabaseCommand {
 		err = panelruntime.DatabaseCommand(ctx, dir, backupPath, restorePath, os.Stdout)
 	} else {
-		err = run(ctx, dir)
+		err = run(ctx, dir, repo)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "imon-desktop:", err)
@@ -55,11 +57,11 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, dir string) (err error) {
+func run(ctx context.Context, dir, repo string) (err error) {
 	if err := desktop.Available(); err != nil {
 		return err
 	}
-	app, err := panelruntime.Open(ctx, dir, version, "", update.Options{})
+	app, err := panelruntime.Open(ctx, dir, version, repo, update.Options{Desktop: true})
 	if err != nil {
 		return err
 	}
