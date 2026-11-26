@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Imon
+Comment=Monitor Linux hosts and Kubernetes clusters
+Exec=imon-desktop
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
