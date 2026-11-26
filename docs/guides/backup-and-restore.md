@@ -9,7 +9,6 @@
 | macOS Web | `imon-web_darwin_amd64.tar.gz` 或 `imon-web_darwin_arm64.tar.gz` | `./imon` |
 | Linux Web | `imon-web_linux_amd64.tar.gz` 或 `imon-web_linux_arm64.tar.gz` | `./imon` |
 | Windows Web | `imon-web_windows_amd64.zip` 或 `imon-web_windows_arm64.zip` | `.\imon.exe` |
-| macOS 桌面 | `imon-desktop_darwin_amd64.zip` 或 `imon-desktop_darwin_arm64.zip` | `"./Imon.app/Contents/MacOS/imon-desktop"` |
 
 只下载一个发行包时，可以将下列命令中的占位符替换为该文件名，然后核对输出与 `SHA256SUMS` 中对应的一行。
 
@@ -79,9 +78,9 @@ Set-Location -LiteralPath '<EXTRACT_DIR>'
 
 ## 更新
 
-如果发行包没有预设仓库，启动时使用 `--release-repo '<GITHUB_OWNER>/<GITHUB_REPO>'` 指定公开的 GitHub 仓库。客户端启动后首次打开面板时自动检查一次更新。有新版本时，侧栏底部的版本号显示红点；点击可查看发布说明和 GitHub 发布页。
+正式发布的 Web 包已预设 GitHub Releases 仓库。如果使用本地构建，可在启动时使用 `--release-repo '<GITHUB_OWNER>/<GITHUB_REPO>'` 指定公开的发布仓库。客户端每次启动后首次打开面板时检查一次更新。有新版本时，侧栏底部的版本号显示红点，点击可查看发布说明和 GitHub 发布页。
 
-在 macOS 和 Linux 上点击 [更新]，应用下载并校验发布包、备份 SQLite、替换当前程序并自动重启。原面板等待重新连接，不必重新输入启动口令。新版本启动失败时，程序回退到旧版本及对应的数据状态并在面板报告结果。
+在 macOS 和 Linux 上点击 [更新]，应用下载并校验发布包、备份 SQLite、替换当前程序并自动重启。原面板在同一地址和会话中重新连接。新版本启动失败时，程序回退到旧版本及对应的数据状态并在面板报告结果。
 
 Windows 或不可进行原地替换的安装位置可从气泡打开 GitHub 发布页，按前面的安装步骤校验并解压新包。手动更新前先备份数据、保留旧程序并退出当前客户端；使用过自定义数据目录时，仍传入同一个 `--data-dir`。手动回退时，停止新进程，用旧版客户端恢复升级前的备份，再启动旧版。
 

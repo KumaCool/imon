@@ -4,7 +4,7 @@ Imon 是 infra monitor 的缩写，是一个**轻量化、超小型的本地监�
 
 项目首版定位为：**一个不依赖独立服务器、不要求目标机常驻 Agent、面向多主机和多集群的本地监控工具**。
 
-当前版本：`v0.1.0`（本地候选版）
+当前版本：`v0.1.0`
 
 ## 设计定位
 
@@ -26,7 +26,7 @@ Imon 是 infra monitor 的缩写，是一个**轻量化、超小型的本地监�
 - 采集设置：配置轮询开关、主机/网络/集群采集间隔和超时；支持在当前页面手动采集。
 - 防火墙辅助程序：按需安装、卸载和核验 Linux 防火墙只读辅助程序，支持 `ufw`、`nftables` 和 `iptables-legacy`。
 - 本地数据：使用 SQLite 保存绑定、采集快照、规则和事件，支持备份与恢复。
-- 版本更新：配置 GitHub Releases 仓库后，检查更新并从应用内查看版本说明。
+- Web 版更新：正式发布包首次打开面板时检查 GitHub Releases。侧栏版本号可显示新版本和发布说明。macOS、Linux 支持一键更新，Windows 可从发布页下载安装包。
 
 ## 工作方式
 
@@ -70,6 +70,8 @@ Web 发布脚本可交叉构建 macOS、Linux 和 Windows 的 `amd64` 与 `arm64
 
 ## 快速开始
 
+从项目的 GitHub Releases 下载与系统和架构匹配的 Web 发布包。校验 `SHA256SUMS` 后解压并启动 `imon`，Windows 使用 `imon.exe`。见[安装、备份与恢复](docs/guides/backup-and-restore.md)。
+
 ### 从源码运行 Web 版
 
 在项目根目录使用 Go `1.26.x`，推荐 Go `1.26.11`：
@@ -93,8 +95,10 @@ http://127.0.0.1:8765/
 
 ### 构建 Web 发布包
 
+将 `<GITHUB_OWNER>/<GITHUB_REPO>` 替换为发布仓库，构建时预设在线更新来源。
+
 ```sh
-GO_BIN=/path/to/go-1.26.11 ./packaging/release/build.sh v0.1.0 dist/imon
+GO_BIN='<GO_EXECUTABLE>' ./packaging/release/build.sh v0.1.0 dist/imon '<GITHUB_OWNER>/<GITHUB_REPO>'
 ```
 
 发布产物位于 `dist/imon/v0.1.0/`。以 macOS Intel 为例：
@@ -119,7 +123,7 @@ tar -xzf dist/imon/v0.1.0/imon-web_darwin_amd64.tar.gz \
 | --- | --- | --- |
 | `--port` | `8765` | 本地 Web 面板端口 |
 | `--data-dir` | 用户级应用目录 | SQLite、锁文件和本地状态目录 |
-| `--release-repo` | 空 | GitHub Releases 仓库，格式为 `owner/repo` |
+| `--release-repo` | 正式发布包预设，源码构建为空 | 指定 GitHub Releases 仓库，格式为 `owner/repo` |
 | `--version` | - | 输出当前版本并退出 |
 | `--backup <FILE>` | - | 面板停止时导出 SQLite 备份 |
 | `--restore <FILE>` | - | 面板启动前恢复 SQLite 备份 |
